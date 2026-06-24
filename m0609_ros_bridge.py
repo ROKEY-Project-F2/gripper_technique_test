@@ -122,8 +122,30 @@ def set_latest_hand_mode(
     global _LATEST_HAND_MODE
     global _HAND_MODE_SEQUENCE
 
-    _LATEST_HAND_MODE = str(mode)
+    _LATEST_HAND_MODE = (
+        str(mode).strip().upper()
+    )
     _HAND_MODE_SEQUENCE += 1
+
+
+def reset_hand_mode_cache(
+    mode: str = "TRACKING",
+) -> int:
+    """
+    새 추종 사이클 시작 전에 이전 HOME 상태를 제거한다.
+
+    반환값은 초기화 직후의 sequence이며, 상태 머신은
+    이 값 이후에 수신된 HOME만 새 중지 명령으로 처리한다.
+    """
+    global _LATEST_HAND_MODE
+    global _HAND_MODE_SEQUENCE
+
+    _LATEST_HAND_MODE = (
+        str(mode).strip().upper()
+    )
+    _HAND_MODE_SEQUENCE += 1
+
+    return _HAND_MODE_SEQUENCE
 
 
 def get_latest_hand_mode():
@@ -837,7 +859,7 @@ def setup_m0609_ros_bridge(
     print(
         "[ROS2 Bridge] ready:\n"
         f"  pick command: {PICK_COMMAND_TOPIC} "
-        "(std_msgs/msg/Int32, send 4/5/6/7)\n"
+        "(std_msgs/msg/Int32, send 7)\n"
         f"  hand raw: {HAND_RAW_TOPIC}\n"
         f"  hand target: {HAND_TARGET_TOPIC}\n"
         f"  hand mode: {HAND_MODE_TOPIC} "

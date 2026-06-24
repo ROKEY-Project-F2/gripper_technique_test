@@ -7,11 +7,13 @@ from typing import Optional, Sequence, Tuple
 
 import numpy as np
 
-from isaacsim.core.utils.types import ArticulationAction
-
 from m0609_ros_bridge import (
     get_latest_hand_mode,
     get_latest_hand_target,
+    reset_hand_mode_cache,
+)
+from temp_dynamic_trays import (
+    downward_tool_orientation_for_tray,
 )
 
 
@@ -31,92 +33,41 @@ class PlacePhase(Enum):
     MOVE_STAGING = auto()
     MOVE_HIGH = auto()
     MOVE_DOWN = auto()
-    JOINT_PLACE = auto()
     RELEASE = auto()
     LIFT = auto()
     RETURN_STAGING = auto()
 
 
 class M0609StateMachine:
-    """
-    상위 상태:
-        IDLE -> PICK -> TRACKING -> PLACE -> IDLE
-
-    동작:
-        IDLE:
-            임시구역에서 대기
-            /m0609/pick_command 값 7을 기다림
-
-        PICK:
-            7번 트레이 피킹
-            임시구역 이동
-            TRACKING 전환
-
-        TRACKING:
-            /hand_xyz 추종
-            /hand_mode == HOME 수신 시 PLACE 전환
-
-        PLACE:
-            임시구역 복귀
-            피킹 위치로 이동
-            저장된 피킹 관절로 정밀 안착
-            그리퍼 해제
-            임시구역 복귀
-            IDLE 전환
-    """
-
     def __init__(
         self,
         *,
         robot,
+        tray_registry,
         tracking_controller,
         pick_place_controller,
         move_controller,
-        tray_positions,
-        tray_top_z: float,
         staging_position: Sequence[float],
-        tool_orientation: Sequence[float],
+        staging_orientation: Sequence[float],
         pick_default_ee_offset: Sequence[float],
         pick_approach_z_correction: float,
         place_link6_above_tray: float,
         place_high_offset: float,
         place_approach_gap: float,
-        place_joint_tolerance: float,
-        place_joint_step: float,
-        place_settle_frames: int,
-        supported_tray_commands: Sequence[int] = (4, 5, 6, 7),
+        supported_tray_commands: Sequence[int],
     ) -> None:
         self.robot = robot
+        self.tray_registry = tray_registry
         self.tracking_controller = tracking_controller
         self.pick_place_controller = pick_place_controller
         self.move_controller = move_controller
 
-        self.tray_positions = {
-            int(command): np.asarray(
-                position,
-                dtype=np.float64,
-            )
-            for command, position
-            in dict(tray_positions).items()
-        }
-
-        self.tray_top_z = float(
-            tray_top_z
-        )
-
-        self.pick_position: Optional[
-            np.ndarray
-        ] = None
-
-        self.tray_position: Optional[
-            np.ndarray
-        ] = None
         self.staging_position = np.asarray(
             staging_position,
             dtype=np.float64,
         )
-        self.tool_orientation = np.asarray(
-            tool_orientation,
+        self.staging_orientation = np.asarray(
+            staging_orientation,
             dtype=np.float64,
         )
         self.pick_default_ee_offset = np.asarray(
@@ -136,15 +87,6 @@ class M0609StateMachine:
         self.place_approach_gap = float(
             place_approach_gap
         )
-        self.place_joint_tolerance = float(
-            place_joint_tolerance
-        )
-        self.place_joint_step = float(
-            place_joint_step
-        )
-        self.place_settle_frames = int(
-            place_settle_frames
-        )
         self.supported_tray_commands = tuple(
             int(value)
             for value in supported_tray_commands
@@ -157,11 +99,24 @@ class M0609StateMachine:
         self._place_phase = PlacePhase.MOVE_STAGING
 
         self._pending_pick_index: Optional[int] = None
-        self._saved_pick_joints: Optional[np.ndarray] = None
+        self._active_tray_id: Optional[int] = None
+
+        # PICK 순간 실제 위치/방향
+        self._pick_position: Optional[np.ndarray] = None
+        self._pick_orientation: Optional[np.ndarray] = None
+
+        # 생성 당시 원복 기준 위치/방향
+        self._place_reference_position: Optional[
+            np.ndarray
+        ] = None
+        self._place_reference_orientation: Optional[
+            np.ndarray
+        ] = None
+        self._place_tool_orientation: Optional[
+            np.ndarray
+        ] = None
 
         self._idle_at_staging = False
-        self._place_settle_count = 0
-
         self._last_hand_mode_sequence = -1
         self._tracking_error_reported = False
 
@@ -169,10 +124,6 @@ class M0609StateMachine:
             "[StateMachine] 초기 상태: IDLE",
             flush=True,
         )
-
-    @property
-    def state(self) -> M0609State:
-        return self._state
 
     @property
     def state_name(self) -> str:
@@ -201,31 +152,32 @@ class M0609StateMachine:
     ) -> Tuple[bool, str]:
         tray_index = int(tray_index)
 
-        if tray_index not in self.tray_positions:
+        if tray_index not in self.supported_tray_commands:
             return (
                 False,
                 "Supported trays: "
                 f"{self.supported_tray_commands}",
             )
 
+        if not self.tray_registry.has_tray(
+            tray_index
+        ):
+            return (
+                False,
+                f"Tray {tray_index} is not registered",
+            )
+
         if self._state != M0609State.IDLE:
             return (
                 False,
-                f"Pick command rejected in "
-                f"{self._state.name}",
-            )
-
-        if self._pending_pick_index is not None:
-            return (
-                False,
-                "A pick command is already pending",
+                f"Pick rejected in {self._state.name}",
             )
 
         self._pending_pick_index = tray_index
 
         return (
             True,
-            f"Tray {tray_index} pick command accepted",
+            f"Tray {tray_index} accepted",
         )
 
     def request_move(
@@ -234,15 +186,15 @@ class M0609StateMachine:
         y: float,
         z: float,
     ) -> Tuple[bool, str]:
-        # 기존 좌표 테스트 토픽과의 호환용.
         return (
             False,
-            "Direct move command is disabled in workflow mode",
+            "Direct move is disabled in workflow mode",
         )
 
     def _set_move_target(
         self,
-        position: np.ndarray,
+        position: Sequence[float],
+        orientation: Sequence[float],
     ) -> None:
         self.move_controller.reset()
         self.move_controller.set_target(
@@ -250,44 +202,24 @@ class M0609StateMachine:
                 position,
                 dtype=np.float64,
             ),
-            orientation=self.tool_orientation,
+            orientation=np.asarray(
+                orientation,
+                dtype=np.float64,
+            ),
         )
 
-    def _limit_joint_step(
-        self,
-        current: np.ndarray,
-        target: np.ndarray,
-    ) -> np.ndarray:
-        current = np.asarray(
-            current,
-            dtype=np.float64,
-        )
-        target = np.asarray(
-            target,
-            dtype=np.float64,
-        )
-
-        delta = target - current
-        delta = np.clip(
-            delta,
-            -self.place_joint_step,
-            self.place_joint_step,
-        )
-
-        return current + delta
-
-    def _place_targets(self):
-        if self.tray_position is None:
+    def _calculate_place_targets(self):
+        if self._place_reference_position is None:
             raise RuntimeError(
-                "Tray position is not selected"
+                "Place reference position is missing"
             )
 
         base = np.array(
             [
-                self.tray_position[0],
-                self.tray_position[1],
+                self._place_reference_position[0],
+                self._place_reference_position[1],
                 (
-                    self.tray_position[2]
+                    self._place_reference_position[2]
                     + self.place_link6_above_tray
                 ),
             ],
@@ -298,12 +230,10 @@ class M0609StateMachine:
             [0.0, 0.0, self.place_high_offset],
             dtype=np.float64,
         )
-
         down = base + np.array(
             [0.0, 0.0, self.place_approach_gap],
             dtype=np.float64,
         )
-
         lift = base + np.array(
             [
                 0.0,
@@ -315,15 +245,13 @@ class M0609StateMachine:
 
         return high, down, lift
 
-    # ========================================================
-    # 상태 진입
-    # ========================================================
     def _on_enter_idle(self) -> None:
         self.robot.gripper.open()
-
         self._idle_at_staging = False
+
         self._set_move_target(
-            self.staging_position
+            self.staging_position,
+            self.staging_orientation,
         )
 
         print(
@@ -334,32 +262,45 @@ class M0609StateMachine:
     def _on_enter_pick(self) -> None:
         if self._pending_pick_index is None:
             raise RuntimeError(
-                "PICK entered without tray command"
+                "PICK entered without command"
             )
 
-        self.tray_position = (
-            self.tray_positions[
-                self._pending_pick_index
-            ].copy()
+        snapshot = self.tray_registry.get_snapshot(
+            self._pending_pick_index
         )
 
-        self.pick_position = (
-            self.tray_position
-            + np.array(
-                [0.0, 0.0, self.tray_top_z],
-                dtype=np.float64,
+        self._active_tray_id = (
+            self._pending_pick_index
+        )
+
+        # 피킹 순간 실제 pose
+        self._pick_position = (
+            snapshot.pick_position.copy()
+        )
+        self._pick_orientation = (
+            snapshot.pick_orientation.copy()
+        )
+
+        # 생성 당시 원복 pose
+        self._place_reference_position = (
+            snapshot.spawn_reference_position.copy()
+        )
+        self._place_reference_orientation = (
+            snapshot.spawn_orientation.copy()
+        )
+        self._place_tool_orientation = (
+            downward_tool_orientation_for_tray(
+                snapshot.spawn_orientation
             )
         )
 
         self._pick_phase = PickPhase.PICKING
-        self._saved_pick_joints = None
-
         self.pick_place_controller.reset()
 
         print(
-            f"[PICK] tray "
-            f"{self._pending_pick_index} 피킹 시작"
-            f" @ {self.tray_position.tolist()}",
+            f"[PICK] tray={self._active_tray_id}, "
+            f"position={self._pick_position.round(4)}, "
+            f"orientation={self._pick_orientation.round(4)}",
             flush=True,
         )
 
@@ -367,34 +308,31 @@ class M0609StateMachine:
         self.tracking_controller.reset()
         self._tracking_error_reported = False
 
-        # TRACKING 진입 전에 들어온 HOME 메시지는 무시하고,
-        # 진입 이후 새 HOME 메시지만 처리한다.
-        _, mode_sequence = get_latest_hand_mode()
+        # 이전 사이클의 HOME 값이 남아 다음 사이클에 영향을
+        # 주지 않도록 TRACKING 진입 시 캐시를 명시적으로 초기화한다.
         self._last_hand_mode_sequence = (
-            mode_sequence
+            reset_hand_mode_cache("TRACKING")
         )
 
         print(
-            "[TRACKING] 손 추종 시작",
+            "[TRACKING] 손 추종 시작 "
+            "(hand mode reset)",
             flush=True,
         )
 
     def _on_enter_place(self) -> None:
         self._place_phase = PlacePhase.MOVE_STAGING
-        self._place_settle_count = 0
 
         self._set_move_target(
-            self.staging_position
+            self.staging_position,
+            self.staging_orientation,
         )
 
         print(
-            "[PLACE] 먼저 임시구역으로 복귀",
+            "[PLACE] 임시구역으로 복귀",
             flush=True,
         )
 
-    # ========================================================
-    # 상태 처리
-    # ========================================================
     def _step_idle(self) -> None:
         if not self._idle_at_staging:
             self.robot.apply_action(
@@ -404,20 +342,25 @@ class M0609StateMachine:
             if self.move_controller.is_done():
                 self._idle_at_staging = True
                 print(
-                    "[IDLE] 임시구역 도착, 명령 대기",
+                    "[IDLE] 명령 대기",
                     flush=True,
                 )
-
             return
 
-        if self._pending_pick_index is None:
-            return
-
-        self._change_state(
-            M0609State.PICK
-        )
+        if self._pending_pick_index is not None:
+            self._change_state(
+                M0609State.PICK
+            )
 
     def _step_pick(self) -> None:
+        if (
+            self._pick_position is None
+            or self._pick_orientation is None
+        ):
+            raise RuntimeError(
+                "Dynamic pick pose is missing"
+            )
+
         if self._pick_phase == PickPhase.PICKING:
             event = (
                 self.pick_place_controller
@@ -433,37 +376,24 @@ class M0609StateMachine:
                     self.pick_approach_z_correction
                 )
 
-            actions = (
-                self.pick_place_controller.forward(
-                    picking_position=(
-                        self.pick_position
-                    ),
-                    placing_position=(
-                        self.pick_position
-                    ),
-                    current_joint_positions=(
-                        self.robot
-                        .get_joint_positions()
-                    ),
-                    end_effector_offset=ee_offset,
-                    end_effector_orientation=(
-                        self.tool_orientation
-                    ),
-                )
+            actions = self.pick_place_controller.forward(
+                picking_position=self._pick_position,
+                placing_position=self._pick_position,
+                current_joint_positions=(
+                    self.robot.get_joint_positions()
+                ),
+                end_effector_offset=ee_offset,
+                end_effector_orientation=(
+                    self._pick_orientation
+                ),
             )
 
             self.robot.apply_action(actions)
 
             if event >= 4:
-                if self._saved_pick_joints is None:
-                    self._saved_pick_joints = (
-                        self.robot
-                        .get_joint_positions()
-                        .copy()
-                    )
-
                 self._set_move_target(
-                    self.staging_position
+                    self.staging_position,
+                    self.staging_orientation,
                 )
                 self._pick_phase = (
                     PickPhase.MOVE_STAGING
@@ -483,26 +413,17 @@ class M0609StateMachine:
             )
 
             if self.move_controller.is_done():
-                print(
-                    "[PICK] 임시구역 도착",
-                    flush=True,
-                )
                 self._change_state(
                     M0609State.TRACKING
                 )
 
     def _step_tracking(self) -> None:
-        hand_mode, mode_sequence = (
+        hand_mode, sequence = (
             get_latest_hand_mode()
         )
 
-        if (
-            mode_sequence
-            != self._last_hand_mode_sequence
-        ):
-            self._last_hand_mode_sequence = (
-                mode_sequence
-            )
+        if sequence != self._last_hand_mode_sequence:
+            self._last_hand_mode_sequence = sequence
 
             if str(hand_mode).strip().upper() == "HOME":
                 self._change_state(
@@ -526,158 +447,80 @@ class M0609StateMachine:
         except Exception as error:
             if not self._tracking_error_reported:
                 print(
-                    "[TRACKING] 오류: "
-                    f"{error}",
+                    f"[TRACKING] 오류: {error}",
                     flush=True,
                 )
                 self._tracking_error_reported = True
 
     def _step_place(self) -> None:
+        if self._place_tool_orientation is None:
+            raise RuntimeError(
+                "Place orientation is missing"
+            )
+
         high, down, lift = (
-            self._place_targets()
+            self._calculate_place_targets()
         )
 
-        if (
-            self._place_phase
-            == PlacePhase.MOVE_STAGING
-        ):
-            self.robot.apply_action(
-                self.move_controller.forward()
-            )
-
-            if self.move_controller.is_done():
-                self._set_move_target(high)
-                self._place_phase = (
-                    PlacePhase.MOVE_HIGH
-                )
-                print(
-                    "[PLACE] 임시구역 도착, "
-                    "트레이 상단 이동",
-                    flush=True,
-                )
-
-        elif (
-            self._place_phase
-            == PlacePhase.MOVE_HIGH
-        ):
-            self.robot.apply_action(
-                self.move_controller.forward()
-            )
-
-            if self.move_controller.is_done():
-                self._set_move_target(down)
-                self._place_phase = (
-                    PlacePhase.MOVE_DOWN
-                )
-                print(
-                    "[PLACE] 트레이 상단 도착, "
-                    "접근 시작",
-                    flush=True,
-                )
-
-        elif (
-            self._place_phase
-            == PlacePhase.MOVE_DOWN
-        ):
-            self.robot.apply_action(
-                self.move_controller.forward()
-            )
-
-            if self.move_controller.is_done():
-                self.move_controller.reset()
-                self._place_phase = (
-                    PlacePhase.JOINT_PLACE
-                )
-                print(
-                    "[PLACE] 저장된 피킹 관절로 "
-                    "정밀 안착",
-                    flush=True,
-                )
-
-        elif (
-            self._place_phase
-            == PlacePhase.JOINT_PLACE
-        ):
-            if self._saved_pick_joints is None:
-                raise RuntimeError(
-                    "Saved pick joints are missing"
-                )
-
-            current = np.asarray(
-                self.robot.get_joint_positions(),
-                dtype=np.float64,
-            )
-
-            stepped = self._limit_joint_step(
-                current,
-                self._saved_pick_joints,
-            )
-
-            self.robot.apply_action(
-                ArticulationAction(
-                    joint_positions=stepped
-                )
-            )
-
-            error = float(
-                np.linalg.norm(
-                    current
-                    - self._saved_pick_joints
-                )
-            )
-
-            if (
-                error
-                < self.place_joint_tolerance
-            ):
-                self._place_settle_count += 1
-
-                if (
-                    self._place_settle_count
-                    >= self.place_settle_frames
-                ):
-                    self._place_phase = (
-                        PlacePhase.RELEASE
-                    )
-                    self._place_settle_count = 0
-            else:
-                self._place_settle_count = 0
-
-        elif (
-            self._place_phase
-            == PlacePhase.RELEASE
-        ):
-            self.robot.gripper.open()
-
-            self._set_move_target(lift)
-            self._place_phase = (
-                PlacePhase.LIFT
-            )
-
-            print(
-                "[PLACE] 그리퍼 해제, 상승",
-                flush=True,
-            )
-
-        elif (
-            self._place_phase
-            == PlacePhase.LIFT
-        ):
+        if self._place_phase == PlacePhase.MOVE_STAGING:
             self.robot.apply_action(
                 self.move_controller.forward()
             )
 
             if self.move_controller.is_done():
                 self._set_move_target(
-                    self.staging_position
+                    high,
+                    self._place_tool_orientation,
+                )
+                self._place_phase = (
+                    PlacePhase.MOVE_HIGH
+                )
+
+        elif self._place_phase == PlacePhase.MOVE_HIGH:
+            self.robot.apply_action(
+                self.move_controller.forward()
+            )
+
+            if self.move_controller.is_done():
+                self._set_move_target(
+                    down,
+                    self._place_tool_orientation,
+                )
+                self._place_phase = (
+                    PlacePhase.MOVE_DOWN
+                )
+
+        elif self._place_phase == PlacePhase.MOVE_DOWN:
+            self.robot.apply_action(
+                self.move_controller.forward()
+            )
+
+            if self.move_controller.is_done():
+                self._place_phase = (
+                    PlacePhase.RELEASE
+                )
+
+        elif self._place_phase == PlacePhase.RELEASE:
+            self.robot.gripper.open()
+
+            self._set_move_target(
+                lift,
+                self._place_tool_orientation,
+            )
+            self._place_phase = PlacePhase.LIFT
+
+        elif self._place_phase == PlacePhase.LIFT:
+            self.robot.apply_action(
+                self.move_controller.forward()
+            )
+
+            if self.move_controller.is_done():
+                self._set_move_target(
+                    self.staging_position,
+                    self.staging_orientation,
                 )
                 self._place_phase = (
                     PlacePhase.RETURN_STAGING
-                )
-
-                print(
-                    "[PLACE] 임시구역 복귀",
-                    flush=True,
                 )
 
         elif (
@@ -689,19 +532,19 @@ class M0609StateMachine:
             )
 
             if self.move_controller.is_done():
-                self._saved_pick_joints = None
-                self._pending_pick_index = None
-                self.pick_position = None
-                self.tray_position = None
-
-                print(
-                    "[PLACE] 완료",
-                    flush=True,
-                )
-
+                self._clear_active_tray()
                 self._change_state(
                     M0609State.IDLE
                 )
+
+    def _clear_active_tray(self) -> None:
+        self._pending_pick_index = None
+        self._active_tray_id = None
+        self._pick_position = None
+        self._pick_orientation = None
+        self._place_reference_position = None
+        self._place_reference_orientation = None
+        self._place_tool_orientation = None
 
     def step(self) -> None:
         if self._state_entered:
@@ -728,23 +571,20 @@ class M0609StateMachine:
     def reset(self) -> None:
         self._state = M0609State.IDLE
         self._state_entered = True
-
         self._pick_phase = PickPhase.PICKING
         self._place_phase = PlacePhase.MOVE_STAGING
-
-        self._pending_pick_index = None
-        self._saved_pick_joints = None
-        self.pick_position = None
-        self.tray_position = None
-
         self._idle_at_staging = False
-        self._place_settle_count = 0
-
         self._last_hand_mode_sequence = -1
         self._tracking_error_reported = False
 
+        self._clear_active_tray()
+
         self.pick_place_controller.reset()
         self.move_controller.reset()
+
+        self._last_hand_mode_sequence = (
+            reset_hand_mode_cache("TRACKING")
+        )
 
         print(
             "[StateMachine] reset -> IDLE",

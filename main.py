@@ -33,6 +33,7 @@ from isaacsim.core.api import World
 from m0609_config import (
     CUROBO_ROBOT_CONFIG_PATH,
     EE_LINK_NAME,
+    ENABLE_TEMP_DYNAMIC_TRAYS,
     INITIAL_SETTLING_FRAMES,
     M0609_DESCRIPTION_PATH,
     M0609_RMPFLOW_CONFIG_PATH,
@@ -42,11 +43,8 @@ from m0609_config import (
     PICK_EVENTS_DT,
     PLACE_APPROACH_GAP,
     PLACE_HIGH_OFFSET,
-    PLACE_JOINT_STEP,
-    PLACE_JOINT_TOLERANCE,
     PLACE_LINK6_ABOVE_TRAY,
     PLACE_MOVE_TOLERANCE,
-    PLACE_SETTLE_FRAMES,
     RMPFLOW_DIR,
     ROBOT_BASE_POSITION,
     ROBOT_BASE_YAW_DEG,
@@ -56,13 +54,15 @@ from m0609_config import (
     STAGING_POSITION,
     SUPPORTED_TRAY_COMMANDS,
     TABLE_HEIGHT,
-    TRAY_POSITIONS,
-    TRAY_TOP_Z,
+    TEMP_TRAY_MASS,
+    TEMP_TRAY_SIZE,
+    TEMP_TRAY_YAW_DEGREES,
     TRACKING_MAX_JOINT_STEP,
     TRACKING_TOOL_ORIENTATION,
     TRACKING_USE_MPC,
     TRACKING_Z_MAX,
     TRACKING_Z_MIN,
+    TRAY_SPAWN_POSITIONS,
 )
 
 
@@ -74,21 +74,16 @@ if RMPFLOW_DIR not in sys.path:
 
 
 from hand_marker_visualizer import HandMarkerVisualizer
-from m0609_pick_place_controller_surface import PickPlaceController
 from m0609_move_controller import M0609MoveController
+from m0609_pick_place_controller_surface import PickPlaceController
 from m0609_ros_bridge import setup_m0609_ros_bridge
 from m0609_state_machine import M0609StateMachine
 from m0609_task import M0609BasicTask, initialize_robot
 from m0609_tracking_controller import M0609TrackingController
+from temp_dynamic_trays import create_temp_dynamic_trays
 
 
 def _open_full_scene() -> None:
-    print(
-        f"[main] 전체 Scene 열기: "
-        f"{ROBOT_USD_PATH}",
-        flush=True,
-    )
-
     result = (
         omni.usd.get_context().open_stage(
             ROBOT_USD_PATH
@@ -143,61 +138,68 @@ def main() -> None:
         world,
     )
 
-    # --------------------------------------------------------
-    # 손 추종 컨트롤러
-    # --------------------------------------------------------
-    tracking_controller = (
-        M0609TrackingController(
-            robot=robot,
-            robot_config_path=(
-                CUROBO_ROBOT_CONFIG_PATH
-            ),
-            base_position=(
-                ROBOT_BASE_POSITION
-            ),
-            base_yaw_deg=(
-                ROBOT_BASE_YAW_DEG
-            ),
-            tool_orientation=(
-                TRACKING_TOOL_ORIENTATION
-            ),
-            z_min=TRACKING_Z_MIN,
-            z_max=TRACKING_Z_MAX,
-            max_joint_step=(
-                TRACKING_MAX_JOINT_STEP
-            ),
-            use_mpc=TRACKING_USE_MPC,
+    # ========================================================
+    # 임시 동적 큐브 생성
+    # 실제 트레이 생성 코드가 준비되면 이 블록만 교체한다.
+    # ========================================================
+    if not ENABLE_TEMP_DYNAMIC_TRAYS:
+        raise RuntimeError(
+            "현재 테스트에서는 "
+            "ENABLE_TEMP_DYNAMIC_TRAYS=True가 필요합니다."
         )
+
+    tray_registry = create_temp_dynamic_trays(
+        world=world,
+        spawn_positions=TRAY_SPAWN_POSITIONS,
+        yaw_degrees=TEMP_TRAY_YAW_DEGREES,
+        tray_size=TEMP_TRAY_SIZE,
+        mass=TEMP_TRAY_MASS,
     )
 
-    # --------------------------------------------------------
-    # PICK 컨트롤러
-    # --------------------------------------------------------
-    pick_place_controller = (
-        PickPlaceController(
-            name="pick_place_controller",
-            gripper=robot.gripper,
-            robot_articulation=robot,
-            end_effector_initial_height=(
-                TABLE_HEIGHT + 0.20
-            ),
-            events_dt=list(PICK_EVENTS_DT),
-            urdf_path=M0609_URDF_PATH,
-            robot_description_path=(
-                M0609_DESCRIPTION_PATH
-            ),
-            rmpflow_config_path=(
-                M0609_RMPFLOW_CONFIG_PATH
-            ),
-            end_effector_frame_name=(
-                EE_LINK_NAME
-            ),
-        )
+    # Scene에 새 rigid body를 추가했으므로 물리 뷰를 다시 초기화한다.
+    world.reset()
+    initialize_robot(
+        robot,
+        world,
+    )
+    tray_registry.reset_to_spawn()
+
+    tracking_controller = M0609TrackingController(
+        robot=robot,
+        robot_config_path=(
+            CUROBO_ROBOT_CONFIG_PATH
+        ),
+        base_position=ROBOT_BASE_POSITION,
+        base_yaw_deg=ROBOT_BASE_YAW_DEG,
+        tool_orientation=(
+            TRACKING_TOOL_ORIENTATION
+        ),
+        z_min=TRACKING_Z_MIN,
+        z_max=TRACKING_Z_MAX,
+        max_joint_step=(
+            TRACKING_MAX_JOINT_STEP
+        ),
+        use_mpc=TRACKING_USE_MPC,
     )
 
-    # --------------------------------------------------------
-    # 임시구역 / PLACE 이동 컨트롤러
-    # --------------------------------------------------------
+    pick_place_controller = PickPlaceController(
+        name="pick_place_controller",
+        gripper=robot.gripper,
+        robot_articulation=robot,
+        end_effector_initial_height=(
+            TABLE_HEIGHT + 0.20
+        ),
+        events_dt=list(PICK_EVENTS_DT),
+        urdf_path=M0609_URDF_PATH,
+        robot_description_path=(
+            M0609_DESCRIPTION_PATH
+        ),
+        rmpflow_config_path=(
+            M0609_RMPFLOW_CONFIG_PATH
+        ),
+        end_effector_frame_name=EE_LINK_NAME,
+    )
+
     move_controller = M0609MoveController(
         name="workflow_move_controller",
         robot_articulation=robot,
@@ -208,9 +210,7 @@ def main() -> None:
         rmpflow_config_path=(
             M0609_RMPFLOW_CONFIG_PATH
         ),
-        end_effector_frame_name=(
-            EE_LINK_NAME
-        ),
+        end_effector_frame_name=EE_LINK_NAME,
         tcp_offset_local=np.zeros(
             3,
             dtype=np.float64,
@@ -220,11 +220,9 @@ def main() -> None:
         ),
     )
 
-    # --------------------------------------------------------
-    # 상태 머신
-    # --------------------------------------------------------
     state_machine = M0609StateMachine(
         robot=robot,
+        tray_registry=tray_registry,
         tracking_controller=(
             tracking_controller
         ),
@@ -232,10 +230,8 @@ def main() -> None:
             pick_place_controller
         ),
         move_controller=move_controller,
-        tray_positions=TRAY_POSITIONS,
-        tray_top_z=TRAY_TOP_Z,
         staging_position=STAGING_POSITION,
-        tool_orientation=(
+        staging_orientation=(
             TRACKING_TOOL_ORIENTATION
         ),
         pick_default_ee_offset=(
@@ -252,15 +248,6 @@ def main() -> None:
         ),
         place_approach_gap=(
             PLACE_APPROACH_GAP
-        ),
-        place_joint_tolerance=(
-            PLACE_JOINT_TOLERANCE
-        ),
-        place_joint_step=(
-            PLACE_JOINT_STEP
-        ),
-        place_settle_frames=(
-            PLACE_SETTLE_FRAMES
         ),
         supported_tray_commands=(
             SUPPORTED_TRAY_COMMANDS
@@ -289,17 +276,14 @@ def main() -> None:
             render=True,
         )
 
-    print("\n[M0609 준비 완료]")
-    print("- 초기 상태: IDLE")
+    print("\n[M0609 동적 큐브 테스트 준비 완료]")
+    print("- 지원 명령: 4, 5, 6, 7")
     print(
-        "- 임시구역:",
-        STAGING_POSITION,
-    )
-    print(
-        "- 시작 명령:"
+        "- 예:"
+        " ros2 topic pub --once"
         " /m0609/pick_command"
         " std_msgs/msg/Int32"
-        " (지원 번호: 4, 5, 6, 7)"
+        " \"{data: 7}\""
     )
     print(
         "- 트래킹 중지:"
@@ -329,6 +313,7 @@ def main() -> None:
                 world,
             )
 
+            tray_registry.reset_to_spawn()
             tracking_controller.reset()
             state_machine.reset()
             hand_marker.reset()
