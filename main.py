@@ -40,7 +40,6 @@ from m0609_config import (
     PICK_APPROACH_Z_CORRECTION,
     PICK_DEFAULT_EE_OFFSET,
     PICK_EVENTS_DT,
-    PICK_POSITION,
     PLACE_APPROACH_GAP,
     PLACE_HIGH_OFFSET,
     PLACE_JOINT_STEP,
@@ -55,14 +54,15 @@ from m0609_config import (
     ROBOT_SCENE_NAME,
     ROBOT_USD_PATH,
     STAGING_POSITION,
+    SUPPORTED_TRAY_COMMANDS,
     TABLE_HEIGHT,
-    TARGET_TRAY_INDEX,
+    TRAY_POSITIONS,
+    TRAY_TOP_Z,
     TRACKING_MAX_JOINT_STEP,
     TRACKING_TOOL_ORIENTATION,
     TRACKING_USE_MPC,
     TRACKING_Z_MAX,
     TRACKING_Z_MIN,
-    TRAY_7_POSITION,
 )
 
 
@@ -232,8 +232,8 @@ def main() -> None:
             pick_place_controller
         ),
         move_controller=move_controller,
-        pick_position=PICK_POSITION,
-        tray_position=TRAY_7_POSITION,
+        tray_positions=TRAY_POSITIONS,
+        tray_top_z=TRAY_TOP_Z,
         staging_position=STAGING_POSITION,
         tool_orientation=(
             TRACKING_TOOL_ORIENTATION
@@ -262,8 +262,8 @@ def main() -> None:
         place_settle_frames=(
             PLACE_SETTLE_FRAMES
         ),
-        supported_tray_index=(
-            TARGET_TRAY_INDEX
+        supported_tray_commands=(
+            SUPPORTED_TRAY_COMMANDS
         ),
     )
 
@@ -297,10 +297,9 @@ def main() -> None:
     )
     print(
         "- 시작 명령:"
-        " ros2 topic pub --once"
         " /m0609/pick_command"
         " std_msgs/msg/Int32"
-        " \"{data: 7}\""
+        " (지원 번호: 4, 5, 6, 7)"
     )
     print(
         "- 트래킹 중지:"

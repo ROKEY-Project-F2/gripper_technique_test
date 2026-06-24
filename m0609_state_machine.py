@@ -72,8 +72,8 @@ class M0609StateMachine:
         tracking_controller,
         pick_place_controller,
         move_controller,
-        pick_position: Sequence[float],
-        tray_position: Sequence[float],
+        tray_positions,
+        tray_top_z: float,
         staging_position: Sequence[float],
         tool_orientation: Sequence[float],
         pick_default_ee_offset: Sequence[float],
@@ -84,21 +84,33 @@ class M0609StateMachine:
         place_joint_tolerance: float,
         place_joint_step: float,
         place_settle_frames: int,
-        supported_tray_index: int = 7,
+        supported_tray_commands: Sequence[int] = (4, 5, 6, 7),
     ) -> None:
         self.robot = robot
         self.tracking_controller = tracking_controller
         self.pick_place_controller = pick_place_controller
         self.move_controller = move_controller
 
-        self.pick_position = np.asarray(
-            pick_position,
-            dtype=np.float64,
+        self.tray_positions = {
+            int(command): np.asarray(
+                position,
+                dtype=np.float64,
+            )
+            for command, position
+            in dict(tray_positions).items()
+        }
+
+        self.tray_top_z = float(
+            tray_top_z
         )
-        self.tray_position = np.asarray(
-            tray_position,
-            dtype=np.float64,
-        )
+
+        self.pick_position: Optional[
+            np.ndarray
+        ] = None
+
+        self.tray_position: Optional[
+            np.ndarray
+        ] = None
         self.staging_position = np.asarray(
             staging_position,
             dtype=np.float64,
@@ -133,8 +145,9 @@ class M0609StateMachine:
         self.place_settle_frames = int(
             place_settle_frames
         )
-        self.supported_tray_index = int(
-            supported_tray_index
+        self.supported_tray_commands = tuple(
+            int(value)
+            for value in supported_tray_commands
         )
 
         self._state = M0609State.IDLE
@@ -188,11 +201,11 @@ class M0609StateMachine:
     ) -> Tuple[bool, str]:
         tray_index = int(tray_index)
 
-        if tray_index != self.supported_tray_index:
+        if tray_index not in self.tray_positions:
             return (
                 False,
-                f"Only tray {self.supported_tray_index} "
-                "is supported",
+                "Supported trays: "
+                f"{self.supported_tray_commands}",
             )
 
         if self._state != M0609State.IDLE:
@@ -264,6 +277,11 @@ class M0609StateMachine:
         return current + delta
 
     def _place_targets(self):
+        if self.tray_position is None:
+            raise RuntimeError(
+                "Tray position is not selected"
+            )
+
         base = np.array(
             [
                 self.tray_position[0],
@@ -314,6 +332,25 @@ class M0609StateMachine:
         )
 
     def _on_enter_pick(self) -> None:
+        if self._pending_pick_index is None:
+            raise RuntimeError(
+                "PICK entered without tray command"
+            )
+
+        self.tray_position = (
+            self.tray_positions[
+                self._pending_pick_index
+            ].copy()
+        )
+
+        self.pick_position = (
+            self.tray_position
+            + np.array(
+                [0.0, 0.0, self.tray_top_z],
+                dtype=np.float64,
+            )
+        )
+
         self._pick_phase = PickPhase.PICKING
         self._saved_pick_joints = None
 
@@ -321,7 +358,8 @@ class M0609StateMachine:
 
         print(
             f"[PICK] tray "
-            f"{self.supported_tray_index} 피킹 시작",
+            f"{self._pending_pick_index} 피킹 시작"
+            f" @ {self.tray_position.tolist()}",
             flush=True,
         )
 
@@ -375,7 +413,6 @@ class M0609StateMachine:
         if self._pending_pick_index is None:
             return
 
-        self._pending_pick_index = None
         self._change_state(
             M0609State.PICK
         )
@@ -653,6 +690,9 @@ class M0609StateMachine:
 
             if self.move_controller.is_done():
                 self._saved_pick_joints = None
+                self._pending_pick_index = None
+                self.pick_position = None
+                self.tray_position = None
 
                 print(
                     "[PLACE] 완료",
@@ -694,6 +734,8 @@ class M0609StateMachine:
 
         self._pending_pick_index = None
         self._saved_pick_joints = None
+        self.pick_position = None
+        self.tray_position = None
 
         self._idle_at_staging = False
         self._place_settle_count = 0

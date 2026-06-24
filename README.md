@@ -779,9 +779,11 @@ export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 ros2 topic echo /m0609/move_result
 ```
 
-### 좌표 명령 전송
+### 물건 집기 명령 4~7
 
 ```bash
-ros2 topic pub --once /m0609/move_command std_msgs/msg/String \
-"{data: '{\"request_id\":\"move_001\",\"x\":0.45,\"y\":0.15,\"z\":0.45}'}"
+ros2 topic pub --once \
+  /m0609/pick_command \
+  std_msgs/msg/Int32 \
+  "{data: 7}"
 ```

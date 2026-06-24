@@ -837,7 +837,7 @@ def setup_m0609_ros_bridge(
     print(
         "[ROS2 Bridge] ready:\n"
         f"  pick command: {PICK_COMMAND_TOPIC} "
-        "(std_msgs/msg/Int32, send 7)\n"
+        "(std_msgs/msg/Int32, send 4/5/6/7)\n"
         f"  hand raw: {HAND_RAW_TOPIC}\n"
         f"  hand target: {HAND_TARGET_TOPIC}\n"
         f"  hand mode: {HAND_MODE_TOPIC} "
