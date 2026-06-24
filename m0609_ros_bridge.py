@@ -50,7 +50,7 @@ HAND_MODE_QOS = r"""
 }
 """
 
-_STATE_MACHINE = None
+_COMMAND_MANAGER = None
 
 _LATEST_HAND_RAW: Optional[
     Tuple[float, float, float]
@@ -66,8 +66,9 @@ _LATEST_HAND_MODE = "TRACKING"
 _HAND_MODE_SEQUENCE = 0
 
 
-def get_state_machine():
-    return _STATE_MACHINE
+def get_command_manager():
+    """외부 명령을 처리할 상위 매니저를 반환한다."""
+    return _COMMAND_MANAGER
 
 
 def set_latest_hand_raw(
@@ -158,7 +159,7 @@ def get_latest_hand_mode():
 _COMMAND_SCRIPT = r"""
 import json
 
-from m0609_ros_bridge import get_state_machine
+from m0609_ros_bridge import get_command_manager
 
 
 def compute(db):
@@ -175,15 +176,15 @@ def compute(db):
         y = float(command["y"])
         z = float(command["z"])
 
-        state_machine = get_state_machine()
+        manager = get_command_manager()
 
-        if state_machine is None:
+        if manager is None:
             raise RuntimeError(
-                "State machine is not registered"
+                "Robot manager is not registered"
             )
 
         accepted, message = (
-            state_machine.request_move(
+            manager.request_move(
                 x,
                 y,
                 z,
@@ -213,22 +214,22 @@ def compute(db):
 
 
 _PICK_COMMAND_SCRIPT = r"""
-from m0609_ros_bridge import get_state_machine
+from m0609_ros_bridge import get_command_manager
 
 
 def compute(db):
     try:
         tray_index = int(db.inputs.command)
 
-        state_machine = get_state_machine()
+        manager = get_command_manager()
 
-        if state_machine is None:
+        if manager is None:
             raise RuntimeError(
-                "State machine is not registered"
+                "Robot manager is not registered"
             )
 
         accepted, message = (
-            state_machine.request_pick_command(
+            manager.request_pick_command(
                 tray_index
             )
         )
@@ -393,11 +394,16 @@ def _create_script_ports() -> None:
 
 
 def setup_m0609_ros_bridge(
-    state_machine,
+    manager,
     simulation_app,
 ) -> None:
-    global _STATE_MACHINE
-    _STATE_MACHINE = state_machine
+    """
+    ROS Bridge가 외부 명령을 전달할 상위 매니저를 등록한다.
+    상태 머신은 ROS Bridge에 직접 등록하지 않는다.
+    """
+    global _COMMAND_MANAGER
+    _COMMAND_MANAGER = manager
+    reset_hand_mode_cache("TRACKING")
 
     enable_extension(
         "isaacsim.ros2.bridge"

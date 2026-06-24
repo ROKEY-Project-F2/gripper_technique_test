@@ -44,6 +44,10 @@ from m0609_config import (
     PLACE_HIGH_OFFSET,
     PLACE_LINK6_ABOVE_TRAY,
     PLACE_MOVE_TOLERANCE,
+    PLACE_RELEASE_MIN_WAIT_FRAMES,
+    PLACE_RELEASE_RETRY_INTERVAL,
+    PLACE_RELEASE_STABLE_FRAMES,
+    PLACE_RELEASE_TIMEOUT_FRAMES,
     RMPFLOW_DIR,
     ROBOT_BASE_POSITION,
     ROBOT_BASE_YAW_DEG,
@@ -57,6 +61,7 @@ from m0609_config import (
     TOOL_MASS,
     TOOL_SCALES,
     TOOL_USDS,
+    TRANSPORT_Z_OFFSET,
     TRAY_ORIENTATION,
     TRAY_TOP_Z,
     TRAY_USD_PATH,
@@ -79,8 +84,16 @@ if RMPFLOW_DIR not in sys.path:
 from hand_marker_visualizer import HandMarkerVisualizer
 from m0609_move_controller import M0609MoveController
 from m0609_pick_place_controller_surface import PickPlaceController
-from m0609_ros_bridge import setup_m0609_ros_bridge
+from m0609_ros_bridge import (
+    get_latest_hand_mode,
+    get_latest_hand_target,
+    reset_hand_mode_cache,
+    setup_m0609_ros_bridge,
+)
 from m0609_state_machine import M0609StateMachine
+from hand_input import CachedHandInput
+from robot_manager import RobotManager
+from robot_runtime import RobotProfile
 from m0609_task import M0609BasicTask, initialize_robot
 from m0609_tracking_controller import M0609TrackingController
 from m0609_dynamic_scene import (
@@ -221,9 +234,24 @@ def main() -> None:
         ),
     )
 
+    # 현재는 기존 단일 손 토픽 캐시를 그대로 사용한다.
+    # 이후 좌/우 손별 getter를 각각 주입하면 상태 머신은 수정하지 않는다.
+    hand_input = CachedHandInput(
+        input_id="CURRENT_HAND",
+        target_getter=get_latest_hand_target,
+        mode_getter=get_latest_hand_mode,
+        mode_resetter=reset_hand_mode_cache,
+    )
+
     state_machine = M0609StateMachine(
+        robot_id="A",
         robot=robot,
         tray_registry=tray_registry,
+        hand_input=hand_input,
+        idle_position=STAGING_POSITION,
+        idle_orientation=(
+            TRACKING_TOOL_ORIENTATION
+        ),
         tracking_controller=(
             tracking_controller
         ),
@@ -231,10 +259,6 @@ def main() -> None:
             pick_place_controller
         ),
         move_controller=move_controller,
-        staging_position=STAGING_POSITION,
-        staging_orientation=(
-            TRACKING_TOOL_ORIENTATION
-        ),
         pick_default_ee_offset=(
             PICK_DEFAULT_EE_OFFSET
         ),
@@ -250,13 +274,50 @@ def main() -> None:
         place_approach_gap=(
             PLACE_APPROACH_GAP
         ),
-        supported_tray_commands=(
-            SUPPORTED_TRAY_COMMANDS
+        transport_z_offset=(
+            TRANSPORT_Z_OFFSET
+        ),
+        place_release_min_wait_frames=(
+            PLACE_RELEASE_MIN_WAIT_FRAMES
+        ),
+        place_release_stable_frames=(
+            PLACE_RELEASE_STABLE_FRAMES
+        ),
+        place_release_retry_interval=(
+            PLACE_RELEASE_RETRY_INTERVAL
+        ),
+        place_release_timeout_frames=(
+            PLACE_RELEASE_TIMEOUT_FRAMES
         ),
     )
 
-    setup_m0609_ros_bridge(
+    # ========================================================
+    # 재사용 가능한 로봇 매니저
+    # 현재는 A 한 대만 등록한다. 이후 B 상태 머신을 같은 방식으로
+    # 생성하고 register_robot()만 한 번 더 호출하면 된다.
+    # ========================================================
+    robot_manager = RobotManager(
+        routes={
+            "B": (
+                STAGING_POSITION,
+                TRACKING_TOOL_ORIENTATION,
+            ),
+        },
+        shared_trays=(),
+    )
+
+    robot_manager.register_robot(
+        profile=RobotProfile.create(
+            robot_id="A",
+            reachable_trays=SUPPORTED_TRAY_COMMANDS,
+            preferred_route="B",
+            fallback_route="A",
+        ),
         state_machine=state_machine,
+    )
+
+    setup_m0609_ros_bridge(
+        manager=robot_manager,
         simulation_app=simulation_app,
     )
 
@@ -316,7 +377,7 @@ def main() -> None:
 
             tray_registry.reset_to_spawn()
             tracking_controller.reset()
-            state_machine.reset()
+            robot_manager.reset()
             hand_marker.reset()
 
             print(
@@ -326,7 +387,7 @@ def main() -> None:
 
         if is_playing:
             hand_marker.update()
-            state_machine.step()
+            robot_manager.step()
 
         was_playing = is_playing
 
