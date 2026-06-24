@@ -106,64 +106,94 @@ TRACKING_USE_MPC = True
 
 
 # ============================================================
-# PICK / PLACE 설정
+# 실제 트레이 / 수술 도구 동적 생성 설정
 # ============================================================
 TABLE_HEIGHT = 1.0
 
+TRAY_USD_PATH = str(
+    _THIS_DIR
+    / "Collected_model_redtray_scaled_for_180mm_pads"
+    / "model_redtray_scaled_for_180mm_pads.usda"
+)
+
+TOOL_DIR = (
+    _THIS_DIR
+    / "SurgicalInstruments_A"
+    / "Model"
+)
+
+TOOL_USDS = (
+    str(TOOL_DIR / "sm_bipolardissectingscissors_a01_01.usd"),
+    str(TOOL_DIR / "sm_caliper_a01_01.usd"),
+    str(TOOL_DIR / "sm_clamps_a01_01.usd"),
+    str(TOOL_DIR / "sm_forceps_a01_01.usd"),
+    str(TOOL_DIR / "sm_handsaws_a01_01.usd"),
+    str(TOOL_DIR / "sm_knife_a01_01.usd"),
+    str(TOOL_DIR / "sm_ligatureneedle_a01_01.usd"),
+    str(TOOL_DIR / "sm_mallet_a01_01.usd"),
+)
+
+TOOL_NAMES = (
+    "바이폴라",
+    "캘리퍼",
+    "클램프",
+    "겸자",
+    "톱",
+    "메스",
+    "갈고리",
+    "망치",
+)
+
+TOOL_DROP_HEIGHT = 0.05
+TOOL_MASS = 0.001
+
+# 수술 도구 USD는 원본 에셋 단위가 커서 meter stage에 맞게 축소한다.
+# 도구별로 독립 조절할 수 있도록 분리했다.
+# 현재는 8종 모두 1/100 스케일을 사용한다.
+TOOL_SCALES = (
+    (0.0060, 0.0060, 0.0060),  # 바이폴라
+    (0.0060, 0.0060, 0.0060),  # 캘리퍼
+    (0.0075, 0.0075, 0.0075),  # 클램프
+    (0.0075, 0.0075, 0.0075),  # 겸자
+    (0.0035, 0.0035, 0.0035),  # 톱
+    (0.0040, 0.0040, 0.0040),  # 메스
+    (0.0075, 0.0075, 0.0075),  # 갈고리
+    (0.0045, 0.0045, 0.0045),  # 망치
+)
+
+TRAY_TOP_Z = 0.0186
+TRAY_Z = 1.05
+
+# 공간 배치를 위해 팀원 코드의 90도 초기 회전을 그대로 사용한다.
+# 모든 트레이에 동일하게 적용하며 랜덤 회전은 사용하지 않는다.
+TRAY_ORIENTATION = (
+    0.7071,
+    0.0,
+    0.0,
+    0.7071,
+)
+
+# 팀원 코드의 트레이 8개 배치 순서:
+# x 하나마다 y=0.55, 0.85 순서
+TRAY_SPAWN_POSITIONS = {
+    0: (-0.72, 0.55, TRAY_Z),
+    1: (-0.72, 0.85, TRAY_Z),
+    2: (-0.24, 0.55, TRAY_Z),
+    3: (-0.24, 0.85, TRAY_Z),
+    4: (0.24, 0.55, TRAY_Z),
+    5: (0.24, 0.85, TRAY_Z),
+    6: (0.72, 0.55, TRAY_Z),
+    7: (0.72, 0.85, TRAY_Z),
+}
+
+# 현재 프로젝트는 우측의 단일 로봇을 사용하므로
+# 실제 작업 명령은 기존과 동일하게 4~7만 허용한다.
 SUPPORTED_TRAY_COMMANDS = (
     4,
     5,
     6,
     7,
 )
-
-# 팀원 코드의 4, 5, 6, 7 위치를 그대로 사용한다.
-# 여기서 z는 큐브 중심이 아니라 기존 트레이 생성 기준 높이다.
-TRAY_SPAWN_POSITIONS = {
-    4: (
-        0.24,
-        0.55,
-        1.05,
-    ),
-    5: (
-        0.24,
-        0.85,
-        1.05,
-    ),
-    6: (
-        0.72,
-        0.55,
-        1.05,
-    ),
-    7: (
-        0.72,
-        0.85,
-        1.05,
-    ),
-}
-
-# 회전 검증을 위한 임시 yaw.
-# 실제 동적 생성 코드가 들어오면 그 코드가 설정한 quaternion을 사용한다.
-TEMP_TRAY_YAW_DEGREES = {
-    4: 0.0,
-    5: 15.0,
-    6: -20.0,
-    7: 35.0,
-}
-
-# 흡착 테스트용 임시 큐브 크기.
-# 실제 트레이보다 XY 접촉 면적을 넉넉하게 키운다.
-# 높이는 기존 트레이와 동일하게 유지해서 PICK/PLACE 높이는 바꾸지 않는다.
-TEMP_TRAY_SIZE = (
-    0.300,
-    0.220,
-    0.01861830,
-)
-
-TEMP_TRAY_MASS = 0.15
-
-# 임시 큐브 생성 기능을 쉽게 제거하기 위한 스위치.
-ENABLE_TEMP_DYNAMIC_TRAYS = True
 
 # 트래킹 구역과 트레이 구역 사이의 임시 대기 위치
 STAGING_POSITION = (
@@ -220,6 +250,7 @@ _REQUIRED_FILES = [
         "CUROBO_ROBOT_CONFIG_PATH",
         CUROBO_ROBOT_CONFIG_PATH,
     ),
+    ("TRAY_USD_PATH", TRAY_USD_PATH),
 ]
 
 for setting_name, setting_path in _REQUIRED_FILES:
@@ -227,4 +258,11 @@ for setting_name, setting_path in _REQUIRED_FILES:
         raise FileNotFoundError(
             f"{setting_name} 파일을 찾을 수 없습니다: "
             f"{setting_path}"
+        )
+
+for tool_index, tool_path in enumerate(TOOL_USDS):
+    if not Path(tool_path).is_file():
+        raise FileNotFoundError(
+            f"TOOL_USDS[{tool_index}] 파일을 찾을 수 없습니다: "
+            f"{tool_path}"
         )

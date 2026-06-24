@@ -33,7 +33,6 @@ from isaacsim.core.api import World
 from m0609_config import (
     CUROBO_ROBOT_CONFIG_PATH,
     EE_LINK_NAME,
-    ENABLE_TEMP_DYNAMIC_TRAYS,
     INITIAL_SETTLING_FRAMES,
     M0609_DESCRIPTION_PATH,
     M0609_RMPFLOW_CONFIG_PATH,
@@ -54,9 +53,13 @@ from m0609_config import (
     STAGING_POSITION,
     SUPPORTED_TRAY_COMMANDS,
     TABLE_HEIGHT,
-    TEMP_TRAY_MASS,
-    TEMP_TRAY_SIZE,
-    TEMP_TRAY_YAW_DEGREES,
+    TOOL_DROP_HEIGHT,
+    TOOL_MASS,
+    TOOL_SCALES,
+    TOOL_USDS,
+    TRAY_ORIENTATION,
+    TRAY_TOP_Z,
+    TRAY_USD_PATH,
     TRACKING_MAX_JOINT_STEP,
     TRACKING_TOOL_ORIENTATION,
     TRACKING_USE_MPC,
@@ -80,7 +83,9 @@ from m0609_ros_bridge import setup_m0609_ros_bridge
 from m0609_state_machine import M0609StateMachine
 from m0609_task import M0609BasicTask, initialize_robot
 from m0609_tracking_controller import M0609TrackingController
-from temp_dynamic_trays import create_temp_dynamic_trays
+from m0609_dynamic_scene import (
+    create_surgical_trays_and_tools,
+)
 
 
 def _open_full_scene() -> None:
@@ -121,6 +126,28 @@ def main() -> None:
 
     task = M0609BasicTask()
     world.add_task(task)
+
+    # ========================================================
+    # 실제 트레이 8개 + 수술 도구 8개 동적 생성
+    #
+    # 반드시 첫 world.reset() 전에 생성해야 한다.
+    # reset 이후 rigid body를 추가하면 physics tensor view가
+    # 무효화될 수 있다.
+    # ========================================================
+    tray_registry = create_surgical_trays_and_tools(
+        world=world,
+        tray_usd_path=TRAY_USD_PATH,
+        tool_usds=TOOL_USDS,
+        tray_positions=TRAY_SPAWN_POSITIONS,
+        tray_orientation=TRAY_ORIENTATION,
+        tray_top_z=TRAY_TOP_Z,
+        tool_drop_height=TOOL_DROP_HEIGHT,
+        tool_mass=TOOL_MASS,
+        tool_scales=TOOL_SCALES,
+        simulation_app=simulation_app,
+    )
+
+    # 로봇, 트레이, 도구를 모두 등록한 뒤 물리를 한 번만 초기화한다.
     world.reset()
 
     robot = world.scene.get_object(
@@ -137,32 +164,6 @@ def main() -> None:
         robot,
         world,
     )
-
-    # ========================================================
-    # 임시 동적 큐브 생성
-    # 실제 트레이 생성 코드가 준비되면 이 블록만 교체한다.
-    # ========================================================
-    if not ENABLE_TEMP_DYNAMIC_TRAYS:
-        raise RuntimeError(
-            "현재 테스트에서는 "
-            "ENABLE_TEMP_DYNAMIC_TRAYS=True가 필요합니다."
-        )
-
-    tray_registry = create_temp_dynamic_trays(
-        world=world,
-        spawn_positions=TRAY_SPAWN_POSITIONS,
-        yaw_degrees=TEMP_TRAY_YAW_DEGREES,
-        tray_size=TEMP_TRAY_SIZE,
-        mass=TEMP_TRAY_MASS,
-    )
-
-    # Scene에 새 rigid body를 추가했으므로 물리 뷰를 다시 초기화한다.
-    world.reset()
-    initialize_robot(
-        robot,
-        world,
-    )
-    tray_registry.reset_to_spawn()
 
     tracking_controller = M0609TrackingController(
         robot=robot,
@@ -276,7 +277,7 @@ def main() -> None:
             render=True,
         )
 
-    print("\n[M0609 동적 큐브 테스트 준비 완료]")
+    print("\n[M0609 실제 트레이/도구 동적 생성 준비 완료]")
     print("- 지원 명령: 4, 5, 6, 7")
     print(
         "- 예:"

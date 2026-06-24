@@ -12,7 +12,7 @@ from m0609_ros_bridge import (
     get_latest_hand_target,
     reset_hand_mode_cache,
 )
-from temp_dynamic_trays import (
+from m0609_dynamic_scene import (
     downward_tool_orientation_for_tray,
 )
 
