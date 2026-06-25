@@ -1,5 +1,4 @@
 # main.py
-
 from isaacsim import SimulationApp
 
 
@@ -26,6 +25,7 @@ import time
 
 import numpy as np
 import omni.usd
+
 from isaacsim.core.api import World
 from isaacsim.core.utils.rotations import (
     quat_to_euler_angles,
@@ -52,37 +52,41 @@ from m0609_config import (
     PLACE_RELEASE_STABLE_FRAMES,
     PLACE_RELEASE_TIMEOUT_FRAMES,
     RMPFLOW_DIR,
+    ROBOT_A_IDLE_JOINT_POSITIONS_DEG,
     ROBOT_A_PRIM_PATH,
     ROBOT_A_TRACKING_JOINT1_DELTA_DEG,
     ROBOT_A_SCENE_NAME,
     ROBOT_A_SUPPORTED_TRAY_COMMANDS,
+    ROBOT_B_IDLE_JOINT_POSITIONS_DEG,
     ROBOT_B_PRIM_PATH,
     ROBOT_B_TRACKING_JOINT1_DELTA_DEG,
+    ROBOT_TRANSIT_Y_OFFSET,
     ROBOT_B_SCENE_NAME,
     ROBOT_B_SUPPORTED_TRAY_COMMANDS,
     RETURN_HOME_MAX_STEP_DEG,
-    RETURN_HOME_WRIST_MAX_STEP_DEG,
     RETURN_HOME_TOLERANCE_DEG,
+    RETURN_HOME_WRIST_MAX_STEP_DEG,
+    ROBOT_USD_PATH,
     SAFE_JOINT_RETURN_MAX_STEP_DEG,
     SAFE_JOINT_RETURN_TOLERANCE_DEG,
-    ROBOT_USD_PATH,
-    TRANSIT_HEIGHT,
     TABLE_HEIGHT,
     TOOL_DROP_HEIGHT,
     TOOL_MASS,
     TOOL_SCALES,
     TOOL_USDS,
-    TRANSPORT_Z_OFFSET,
-    TRAY_ORIENTATION,
-    TRAY_SPAWN_POSITIONS,
-    TRAY_TOP_Z,
-    TRAY_USD_PATH,
     TRACKING_MAX_JOINT_STEP,
     TRACKING_TOOL_ORIENTATION,
     TRACKING_USE_MPC,
     TRACKING_Z_MAX,
     TRACKING_Z_MIN,
+    TRANSIT_HEIGHT,
+    TRANSPORT_Z_OFFSET,
+    TRAY_ORIENTATION,
+    TRAY_SPAWN_POSITIONS,
+    TRAY_TOP_Z,
+    TRAY_USD_PATH,
 )
+
 
 if RMPFLOW_DIR not in sys.path:
     sys.path.insert(
@@ -178,6 +182,7 @@ def _get_robot_base_pose(
         position,
         dtype=np.float64,
     )
+
     orientation = np.asarray(
         orientation,
         dtype=np.float64,
@@ -193,38 +198,6 @@ def _get_robot_base_pose(
 
     return position, yaw_deg
 
-
-def _mirror_transit_position(
-    *,
-    robot_base_position,
-    center_transit_position,
-) -> np.ndarray:
-    """
-    로봇 베이스를 중심으로 중앙 경유지를 반대편에 반사한다.
-
-    x, y:
-        mirrored = 2 * robot_base - center
-
-    z:
-        세 경유지 모두 중앙 경유지와 같은 높이를 사용한다.
-    """
-    base = np.asarray(
-        robot_base_position,
-        dtype=np.float64,
-    )
-    center = np.asarray(
-        center_transit_position,
-        dtype=np.float64,
-    )
-
-    mirrored = center.copy()
-    mirrored[:2] = (
-        2.0 * base[:2]
-        - center[:2]
-    )
-    mirrored[2] = center[2]
-
-    return mirrored
 
 
 def _create_tracking_controller(
@@ -267,7 +240,7 @@ def _create_pick_place_controller(
 ):
     return PickPlaceController(
         name=(
-            f"pick_place_controller_"
+            "pick_place_controller_"
             f"{robot_id.lower()}"
         ),
         gripper=robot.gripper,
@@ -296,7 +269,7 @@ def _create_move_controller(
 ):
     return M0609MoveController(
         name=(
-            f"workflow_move_controller_"
+            "workflow_move_controller_"
             f"{robot_id.lower()}"
         ),
         robot_articulation=robot,
@@ -438,6 +411,7 @@ def main() -> None:
     robot_a = world.scene.get_object(
         ROBOT_A_SCENE_NAME
     )
+
     robot_b = world.scene.get_object(
         ROBOT_B_SCENE_NAME
     )
@@ -458,68 +432,82 @@ def main() -> None:
         robot_a,
         world,
     )
+
     initialize_robot(
         robot_b,
         world,
     )
 
-    initial_joint_positions_a = (
+    # 씬에 저장된 현재 관절 자세를 IDLE 기준 자세로 사용한다.
+    # initialize_robot() 직후의 순간값을 읽지 않기 때문에,
+    # 시뮬레이션 초기화 타이밍에 따라 IDLE 자세가 달라지지 않는다.
+    initial_joint_positions_a = np.deg2rad(
         np.asarray(
-            robot_a.get_joint_positions(),
+            ROBOT_A_IDLE_JOINT_POSITIONS_DEG,
             dtype=np.float64,
-        ).copy()
-    )
-    initial_joint_positions_b = (
-        np.asarray(
-            robot_b.get_joint_positions(),
-            dtype=np.float64,
-        ).copy()
+        )
     )
 
-    robot_a_base_position, robot_a_base_yaw_deg = (
-        _get_robot_base_pose(robot_a)
-    )
-    robot_b_base_position, robot_b_base_yaw_deg = (
-        _get_robot_base_pose(robot_b)
+    initial_joint_positions_b = np.deg2rad(
+        np.asarray(
+            ROBOT_B_IDLE_JOINT_POSITIONS_DEG,
+            dtype=np.float64,
+        )
     )
 
-    # 중앙 경유지 2는 두 로봇 베이스의 정확한 중점에 둔다.
-    # 높이는 기존 경유지 높이인 TRANSIT_HEIGHT를 유지한다.
-    transit_2_position = np.array(
+    print(
+        "[main] IDLE joint positions from config:\n"
+        f" A(deg)="
+        f"{np.degrees(initial_joint_positions_a).round(4)}\n"
+        f" B(deg)="
+        f"{np.degrees(initial_joint_positions_b).round(4)}",
+        flush=True,
+    )
+
+    (
+        robot_a_base_position,
+        robot_a_base_yaw_deg,
+    ) = _get_robot_base_pose(robot_a)
+
+    (
+        robot_b_base_position,
+        robot_b_base_yaw_deg,
+    ) = _get_robot_base_pose(robot_b)
+
+    # 현재 배치:
+    #
+    #     4 5
+    #   a 2 3 b
+    #   A 0 1 B
+    #
+    # a, b는 각 로봇 베이스에서 Y축 +0.30m 지점이다.
+    # X 좌표는 각 로봇 베이스와 동일하게 유지한다.
+    robot_a_transit_position = np.array(
         [
-            (
-                robot_a_base_position[0]
-                + robot_b_base_position[0]
-            )
-            / 2.0,
-            (
-                robot_a_base_position[1]
-                + robot_b_base_position[1]
-            )
-            / 2.0,
+            robot_a_base_position[0],
+            robot_a_base_position[1]
+            + ROBOT_TRANSIT_Y_OFFSET,
             TRANSIT_HEIGHT,
         ],
         dtype=np.float64,
     )
 
-    # 경유지 1과 3은 각 로봇 베이스를 중심으로
-    # 경유지 2를 반대편에 같은 거리만큼 반사한다.
-    transit_1_position = _mirror_transit_position(
-        robot_base_position=robot_a_base_position,
-        center_transit_position=transit_2_position,
+    robot_b_transit_position = np.array(
+        [
+            robot_b_base_position[0],
+            robot_b_base_position[1]
+            + ROBOT_TRANSIT_Y_OFFSET,
+            TRANSIT_HEIGHT,
+        ],
+        dtype=np.float64,
     )
-    transit_3_position = _mirror_transit_position(
-        robot_base_position=robot_b_base_position,
-        center_transit_position=transit_2_position,
-    )
-
-
 
     print(
-        "[main] transit positions:\n"
-        f"  TRANSIT_1={transit_1_position.round(4)}\n"
-        f"  TRANSIT_2={transit_2_position.round(4)}\n"
-        f"  TRANSIT_3={transit_3_position.round(4)}",
+        "[main] upper transit positions:\n"
+        f" A/TRANSIT_A="
+        f"{robot_a_transit_position.round(4)}\n"
+        f" B/TRANSIT_B="
+        f"{robot_b_transit_position.round(4)}",
         flush=True,
     )
 
@@ -527,16 +515,25 @@ def main() -> None:
         _create_tracking_controller(
             robot=robot_a,
             robot_id="A",
-            base_position=robot_a_base_position,
-            base_yaw_deg=robot_a_base_yaw_deg,
+            base_position=(
+                robot_a_base_position
+            ),
+            base_yaw_deg=(
+                robot_a_base_yaw_deg
+            ),
         )
     )
+
     tracking_controller_b = (
         _create_tracking_controller(
             robot=robot_b,
             robot_id="B",
-            base_position=robot_b_base_position,
-            base_yaw_deg=robot_b_base_yaw_deg,
+            base_position=(
+                robot_b_base_position
+            ),
+            base_yaw_deg=(
+                robot_b_base_yaw_deg
+            ),
         )
     )
 
@@ -546,6 +543,7 @@ def main() -> None:
             robot_id="A",
         )
     )
+
     pick_place_controller_b = (
         _create_pick_place_controller(
             robot=robot_b,
@@ -559,6 +557,7 @@ def main() -> None:
             robot_id="A",
         )
     )
+
     move_controller_b = (
         _create_move_controller(
             robot=robot_b,
@@ -635,31 +634,10 @@ def main() -> None:
     )
 
     robot_manager = RobotManager(
-        routes={
-            "TRANSIT_1": (
-                transit_1_position,
-                TRACKING_TOOL_ORIENTATION,
-                np.deg2rad(
-                    ROBOT_A_TRACKING_JOINT1_DELTA_DEG
-                ),
-            ),
-            "TRANSIT_2": (
-                transit_2_position,
-                TRACKING_TOOL_ORIENTATION,
-                0.0,
-            ),
-            "TRANSIT_3": (
-                transit_3_position,
-                TRACKING_TOOL_ORIENTATION,
-                np.deg2rad(
-                    ROBOT_B_TRACKING_JOINT1_DELTA_DEG
-                ),
-            ),
-        },
-        locked_routes=(
-            "TRANSIT_2",
+        tray_positions=TRAY_SPAWN_POSITIONS,
+        shared_trays=tuple(
+            TRAY_SPAWN_POSITIONS.keys()
         ),
-        shared_trays=(),
     )
 
     robot_manager.register_robot(
@@ -668,8 +646,19 @@ def main() -> None:
             reachable_trays=(
                 ROBOT_A_SUPPORTED_TRAY_COMMANDS
             ),
-            preferred_route="TRANSIT_2",
-            fallback_route="TRANSIT_1",
+            route_id="TRANSIT_A",
+            transit_position=(
+                robot_a_transit_position
+            ),
+            transit_orientation=(
+                TRACKING_TOOL_ORIENTATION
+            ),
+            tracking_joint1_delta_rad=np.deg2rad(
+                ROBOT_A_TRACKING_JOINT1_DELTA_DEG
+            ),
+            selection_position=(
+                robot_a_base_position
+            ),
         ),
         state_machine=state_machine_a,
     )
@@ -680,8 +669,19 @@ def main() -> None:
             reachable_trays=(
                 ROBOT_B_SUPPORTED_TRAY_COMMANDS
             ),
-            preferred_route="TRANSIT_2",
-            fallback_route="TRANSIT_3",
+            route_id="TRANSIT_B",
+            transit_position=(
+                robot_b_transit_position
+            ),
+            transit_orientation=(
+                TRACKING_TOOL_ORIENTATION
+            ),
+            tracking_joint1_delta_rad=np.deg2rad(
+                ROBOT_B_TRACKING_JOINT1_DELTA_DEG
+            ),
+            selection_position=(
+                robot_b_base_position
+            ),
         ),
         state_machine=state_machine_b,
     )
@@ -756,26 +756,22 @@ def main() -> None:
         "\n[M0609 Robot A/B 준비 완료]"
     )
     print(
-        "- Robot A: trays 0,1,2,3 "
-        "/ left hand"
+        "- Robot A/B: trays 0~5 공용 접근"
     )
     print(
-        "- Robot B: trays 4,5,6,7 "
-        "/ right hand"
+        "- Robot 선택: 트레이까지 가까운 로봇"
     )
     print(
-        "- TRANSIT_2: A/B 공용 우선 경로 + LOCK"
+        "- 거리 동률: Robot B 우선"
     )
     print(
-        "- Robot A fallback: "
-        "TRANSIT_1 -> joint1 +90deg -> TRACKING"
+        "- Tray zone: 신규 PICK/PLACE 구역 LOCK, 큐 없음"
     )
     print(
-        "- Robot B fallback: "
-        "TRANSIT_3 -> joint1 -90deg -> TRACKING"
+        "- Robot A: upper transit -> joint1 +180deg -> TRACKING"
     )
     print(
-        "- PLACE 명령: 회전 완료 관절 자세 복귀 -> joint1 원복 -> 같은 경유지 -> 트레이"
+        "- Robot B: upper transit -> joint1 -180deg -> TRACKING"
     )
     print()
 
@@ -785,6 +781,7 @@ def main() -> None:
         world.step(
             render=True,
         )
+
         time.sleep(0.01)
 
         is_playing = world.is_playing()
@@ -799,6 +796,7 @@ def main() -> None:
                 robot_a,
                 world,
             )
+
             initialize_robot(
                 robot_b,
                 world,
@@ -829,16 +827,89 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    import sys
     import traceback
+    from datetime import datetime
+    from pathlib import Path
 
     try:
         main()
-    except Exception:
+
+    except KeyboardInterrupt:
         print(
-            "\n[FATAL] Isaac Sim 실행 중 예외가 발생했습니다.",
+            "\n[main] 사용자 중단으로 종료합니다.",
             flush=True,
         )
-        traceback.print_exc()
-        raise
-    finally:
+        simulation_app.close()
+
+    except BaseException:
+        timestamp = datetime.now().strftime(
+            "%Y%m%d_%H%M%S"
+        )
+
+        crash_log_path = Path(
+            f"isaac_sim_crash_{timestamp}.log"
+        ).resolve()
+
+        traceback_text = traceback.format_exc()
+
+        print(
+            "\n"
+            "========================================\n"
+            "[FATAL] Isaac Sim 실행 중 예외 발생\n"
+            "========================================",
+            file=sys.stderr,
+            flush=True,
+        )
+
+        print(
+            traceback_text,
+            file=sys.stderr,
+            flush=True,
+        )
+
+        try:
+            crash_log_path.write_text(
+                traceback_text,
+                encoding="utf-8",
+            )
+
+            print(
+                "[FATAL] 오류 로그 저장 위치: "
+                f"{crash_log_path}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+        except Exception as log_error:
+            print(
+                "[FATAL] 오류 로그 저장 실패: "
+                f"{log_error}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+        print(
+            "[FATAL] 오류 확인을 위해 "
+            "Isaac Sim 창을 유지합니다.\n"
+            "터미널에서 위 traceback을 확인하세요.\n"
+            "창을 닫으면 프로세스가 종료됩니다.",
+            file=sys.stderr,
+            flush=True,
+        )
+
+        # 예외가 발생해도 즉시 simulation_app.close()를 호출하지 않는다.
+        # 사용자가 창을 직접 닫을 때까지 GUI와 터미널을 유지한다.
+        while simulation_app.is_running():
+            try:
+                simulation_app.update()
+
+            except BaseException:
+                # 이미 치명적 오류가 발생한 뒤이므로,
+                # 유지 루프에서 추가 오류가 나도 원래 traceback을 보존한다.
+                break
+
+        simulation_app.close()
+
+    else:
         simulation_app.close()

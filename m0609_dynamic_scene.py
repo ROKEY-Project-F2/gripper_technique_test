@@ -1,5 +1,4 @@
 # m0609_dynamic_scene.py
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -32,13 +31,75 @@ def quaternion_to_yaw(
     )
 
 
+def multiply_quaternions(
+    lhs: Sequence[float],
+    rhs: Sequence[float],
+) -> np.ndarray:
+    """Isaac Sim 순서 [w, x, y, z] quaternion 곱."""
+    lw, lx, ly, lz = np.asarray(
+        lhs,
+        dtype=np.float64,
+    )
+    rw, rx, ry, rz = np.asarray(
+        rhs,
+        dtype=np.float64,
+    )
+
+    result = np.array(
+        [
+            lw * rw - lx * rx - ly * ry - lz * rz,
+            lw * rx + lx * rw + ly * rz - lz * ry,
+            lw * ry - lx * rz + ly * rw + lz * rx,
+            lw * rz + lx * ry - ly * rx + lz * rw,
+        ],
+        dtype=np.float64,
+    )
+
+    norm = float(
+        np.linalg.norm(result)
+    )
+
+    if norm < 1e-12:
+        raise ValueError(
+            "Quaternion norm is zero"
+        )
+
+    return result / norm
+
+
+def rotate_orientation_about_z(
+    orientation: Sequence[float],
+    angle_deg: float,
+) -> np.ndarray:
+    """기존 orientation에 월드 Z축 회전을 추가한다."""
+    half_angle = np.deg2rad(
+        float(angle_deg)
+    ) * 0.5
+
+    z_rotation = np.array(
+        [
+            np.cos(half_angle),
+            0.0,
+            0.0,
+            np.sin(half_angle),
+        ],
+        dtype=np.float64,
+    )
+
+    return multiply_quaternions(
+        z_rotation,
+        orientation,
+    )
+
+
 def downward_tool_orientation_for_tray(
     tray_orientation: Sequence[float],
 ) -> np.ndarray:
-    """트레이의 현재 yaw에 맞춘 하향 그리퍼 quaternion을 만든다."""
+    """트레이 yaw에 맞춘 하향 그리퍼 quaternion을 만든다."""
     tray_yaw = quaternion_to_yaw(
         tray_orientation
     )
+
     ee_yaw = tray_yaw + np.pi / 2.0
     half = ee_yaw * 0.5
 
@@ -74,7 +135,7 @@ class TrayRecord:
 
 
 class DynamicTrayRegistry:
-    """실제 트레이의 현재 pose와 생성 당시 pose를 ID별로 관리한다."""
+    """트레이의 현재 pose와 생성 당시 pose를 ID별로 관리한다."""
 
     def __init__(self) -> None:
         self._records: Dict[int, TrayRecord] = {}
@@ -131,6 +192,7 @@ class DynamicTrayRegistry:
             current_position,
             dtype=np.float64,
         )
+
         current_orientation = np.asarray(
             current_orientation,
             dtype=np.float64,
@@ -139,15 +201,23 @@ class DynamicTrayRegistry:
         pick_position = (
             current_position
             + np.array(
-                [0.0, 0.0, record.top_offset_z],
+                [
+                    0.0,
+                    0.0,
+                    record.top_offset_z,
+                ],
                 dtype=np.float64,
             )
         )
 
         return TrayPoseSnapshot(
             tray_id=tray_id,
-            current_reference_position=current_position.copy(),
-            current_orientation=current_orientation.copy(),
+            current_reference_position=(
+                current_position.copy()
+            ),
+            current_orientation=(
+                current_orientation.copy()
+            ),
             pick_position=pick_position,
             pick_orientation=(
                 downward_tool_orientation_for_tray(
@@ -163,12 +233,12 @@ class DynamicTrayRegistry:
         )
 
     def reset_to_spawn(self) -> None:
-        """트레이만 최초 생성 위치로 복원한다."""
         for record in self._records.values():
             record.rigid_object.set_world_pose(
                 position=record.spawn_reference_position,
                 orientation=record.spawn_orientation,
             )
+
             _clear_velocity(
                 record.rigid_object
             )
@@ -186,6 +256,7 @@ def _clear_velocity(
             method_name,
             None,
         )
+
         if callable(method):
             method(
                 np.zeros(
@@ -198,12 +269,6 @@ def _clear_velocity(
 def _find_source_rigid_prim_path(
     tool_usd_path: str,
 ) -> Sdf.Path:
-    """
-    도구 USD 전체 defaultPrim이 아니라 실제 RigidBody Prim만 찾는다.
-
-    이 방식으로 도구 USD 안에 잘못 저장된 트레이 payload 같은
-    불필요한 sibling Prim은 현재 Stage에 불러오지 않는다.
-    """
     source_stage = Usd.Stage.Open(
         tool_usd_path,
         load=Usd.Stage.LoadNone,
@@ -211,7 +276,8 @@ def _find_source_rigid_prim_path(
 
     if source_stage is None:
         raise RuntimeError(
-            f"도구 USD를 열 수 없습니다: {tool_usd_path}"
+            "도구 USD를 열 수 없습니다: "
+            f"{tool_usd_path}"
         )
 
     default_prim = source_stage.GetDefaultPrim()
@@ -249,7 +315,6 @@ def _find_source_rigid_prim_path(
             f"찾을 수 없습니다: {tool_usd_path}"
         )
 
-    # 가장 상위에 있는 RigidBody를 선택한다.
     rigid_candidates.sort(
         key=lambda path: len(
             path.pathString.split("/")
@@ -264,12 +329,6 @@ def _configure_existing_tool_physics(
     *,
     mass: float,
 ) -> None:
-    """
-    도구 USD에 이미 존재하는 RigidBody를 그대로 사용한다.
-
-    부모 루트에 RigidBodyAPI를 새로 적용하지 않으므로
-    중첩 RigidBody hierarchy 오류가 발생하지 않는다.
-    """
     if not tool_prim.HasAPI(
         UsdPhysics.RigidBodyAPI
     ):
@@ -308,6 +367,7 @@ def _configure_existing_tool_physics(
                 child
             )
         )
+
         collision.GetApproximationAttr().Set(
             "convexHull"
         )
@@ -319,15 +379,10 @@ def _create_tool_reference(
     tool_id: int,
     tool_usd_path: str,
     tool_position: Sequence[float],
+    tool_orientation: Sequence[float],
     tool_scale: Sequence[float],
     tool_mass: float,
 ) -> None:
-    """
-    source USD의 실제 도구 RigidBody Prim만 /World/tool_N에 참조한다.
-
-    tool USD 전체 /RootNode를 참조하지 않기 때문에,
-    잘못 포함된 model_redtray payload도 로드되지 않는다.
-    """
     source_prim_path = (
         _find_source_rigid_prim_path(
             tool_usd_path
@@ -363,6 +418,26 @@ def _create_tool_reference(
             f"도구 Prim 생성 실패: {target_path}"
         )
 
+    orientation = np.asarray(
+        tool_orientation,
+        dtype=np.float64,
+    )
+
+    scale = np.asarray(
+        tool_scale,
+        dtype=np.float64,
+    )
+
+    if orientation.shape != (4,):
+        raise ValueError(
+            "tool_orientation은 길이 4여야 합니다."
+        )
+
+    if scale.shape != (3,):
+        raise ValueError(
+            "tool_scale은 길이 3이어야 합니다."
+        )
+
     with Usd.EditContext(
         stage,
         stage.GetRootLayer(),
@@ -370,10 +445,12 @@ def _create_tool_reference(
         xformable = UsdGeom.Xformable(
             tool_prim
         )
+
         xformable.ClearXformOpOrder()
         xformable.SetResetXformStack(
             True
         )
+
         xformable.AddTranslateOp().Set(
             Gf.Vec3d(
                 float(tool_position[0]),
@@ -382,15 +459,18 @@ def _create_tool_reference(
             )
         )
 
-        scale = np.asarray(
-            tool_scale,
-            dtype=np.float64,
-        )
-
-        if scale.shape != (3,):
-            raise ValueError(
-                f"tool_scale은 길이 3이어야 합니다: {scale}"
+        xformable.AddOrientOp(
+            precision=UsdGeom.XformOp.PrecisionDouble
+        ).Set(
+            Gf.Quatd(
+                float(orientation[0]),
+                Gf.Vec3d(
+                    float(orientation[1]),
+                    float(orientation[2]),
+                    float(orientation[3]),
+                ),
             )
+        )
 
         xformable.AddScaleOp().Set(
             Gf.Vec3f(
@@ -400,10 +480,10 @@ def _create_tool_reference(
             )
         )
 
-        _configure_existing_tool_physics(
-            tool_prim,
-            mass=tool_mass,
-        )
+    _configure_existing_tool_physics(
+        tool_prim,
+        mass=tool_mass,
+    )
 
 
 def create_surgical_trays_and_tools(
@@ -411,29 +491,40 @@ def create_surgical_trays_and_tools(
     world: World,
     tray_usd_path: str,
     tool_usds: Sequence[str],
-    tray_positions: Mapping[int, Sequence[float]],
+    tray_positions: Mapping[
+        int,
+        Sequence[float],
+    ],
     tray_orientation: Sequence[float],
     tray_top_z: float,
     tool_drop_height: float,
     tool_mass: float,
-    tool_scales: Sequence[Sequence[float]],
+    tool_scales: Sequence[
+        Sequence[float]
+    ],
     simulation_app,
 ) -> DynamicTrayRegistry:
     """
-    실제 트레이 8개와 도구 8개를 물리 초기화 전에 생성한다.
+    2열×3행 구조로 트레이 6개와 도구 6개를 생성한다.
 
-    트레이 초기 회전은 모두 동일하며 랜덤 회전은 없다.
+    배치 번호:
+        4 5
+        2 3
+      A 0 1 B
+
+    트레이가 90도 추가 회전되므로 도구도 동일한 yaw로
+    생성해서 트레이 방향과 일치시킨다.
     """
-    if len(tool_usds) < len(
+    tray_count = len(
         tray_positions
-    ):
+    )
+
+    if len(tool_usds) < tray_count:
         raise ValueError(
             "트레이 수보다 TOOL_USDS 수가 적습니다."
         )
 
-    if len(tool_scales) < len(
-        tray_positions
-    ):
+    if len(tool_scales) < tray_count:
         raise ValueError(
             "트레이 수보다 TOOL_SCALES 수가 적습니다."
         )
@@ -443,6 +534,7 @@ def create_surgical_trays_and_tools(
         .get_context()
         .get_stage()
     )
+
     registry = DynamicTrayRegistry()
 
     tray_orientation = np.asarray(
@@ -450,10 +542,16 @@ def create_surgical_trays_and_tools(
         dtype=np.float64,
     )
 
+    if tray_orientation.shape != (4,):
+        raise ValueError(
+            "tray_orientation은 길이 4여야 합니다."
+        )
+
     for tray_id, position in sorted(
         tray_positions.items()
     ):
         tray_id = int(tray_id)
+
         position = np.asarray(
             position,
             dtype=np.float64,
@@ -512,11 +610,21 @@ def create_surgical_trays_and_tools(
             )
         )
 
+        # 도구 USD의 기본 축이 트레이와 90도 다르므로,
+        # 트레이 orientation에 Z축 +90도를 추가한다.
+        tool_orientation = (
+            rotate_orientation_about_z(
+                tray_orientation,
+                90.0,
+            )
+        )
+
         _create_tool_reference(
             stage=stage,
             tool_id=tray_id,
             tool_usd_path=tool_usds[tray_id],
             tool_position=tool_position,
+            tool_orientation=tool_orientation,
             tool_scale=tool_scales[tray_id],
             tool_mass=tool_mass,
         )
@@ -524,14 +632,18 @@ def create_surgical_trays_and_tools(
         print(
             f"[DynamicScene] tray={tray_id}, "
             f"position={position.tolist()}, "
+            f"tray_orientation="
+            f"{tray_orientation.round(5).tolist()}, "
+            f"tool_orientation="
+            f"{tool_orientation.round(5).tolist()}, "
             f"tool={Path(tool_usds[tray_id]).name}, "
             f"scale={tuple(tool_scales[tray_id])}",
             flush=True,
         )
 
     print(
-        "[DynamicScene] 실제 트레이 8개와 "
-        "도구 8개 생성 완료",
+        "[DynamicScene] 트레이 6개와 "
+        "도구 6개 생성 완료",
         flush=True,
     )
 

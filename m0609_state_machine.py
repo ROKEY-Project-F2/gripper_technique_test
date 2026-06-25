@@ -22,6 +22,12 @@ class M0609State(Enum):
 
 
 class PickPhase(Enum):
+    # 집기 전:
+    # 경유지 이동 -> 기존 180도 회전의 반대 방향으로 90도 회전
+    MOVE_PRE_PICK_TRANSIT = auto()
+    ROTATE_PRE_PICK = auto()
+
+    # 기존 집기 및 운반:
     PICKING = auto()
     MOVE_TRANSIT = auto()
     ROTATE_JOINT1_OUT = auto()
@@ -36,6 +42,10 @@ class PlacePhase(Enum):
     RELEASE = auto()
     RELEASE_WAIT = auto()
     LIFT = auto()
+
+    # PLACE 완료 후 집기 전 동작을 역순으로 수행한다.
+    MOVE_POST_PLACE_TRANSIT = auto()
+    ROTATE_PRE_PICK_BACK = auto()
 
 
 class M0609StateMachine:
@@ -203,12 +213,20 @@ class M0609StateMachine:
         self._state = M0609State.IDLE
         self._state_entered = True
 
-        self._pick_phase = PickPhase.PICKING
+        self._pick_phase = PickPhase.MOVE_PRE_PICK_TRANSIT
         self._place_phase = PlacePhase.MOVE_SAFE_RETURN
 
-        # 경유지 도착 당시의 joint1 각도와 회전 목표.
+        # 집기 전 경유지에서 90도 회전하기 전 joint1 각도.
+        # PLACE 완료 후 이 각도로 되돌린다.
+        self._joint1_before_pre_pick: Optional[float] = None
+
+        # 집은 뒤 경유지에서 180도 회전하기 전 joint1 각도.
         self._joint1_before_tracking: Optional[float] = None
         self._joint1_target: Optional[float] = None
+
+        # 집기 전/PLACE 후 경유지 이동에서 유지할 EE orientation.
+        self._pre_pick_transit_orientation: Optional[np.ndarray] = None
+        self._post_place_transit_orientation: Optional[np.ndarray] = None
 
         # joint1 90도 회전이 끝난 순간의 전체 관절 자세.
         # PLACE 명령 시 Cartesian IK가 아니라 이 관절 자세로 복귀한다.
@@ -344,7 +362,9 @@ class M0609StateMachine:
         position[2] += self.transport_z_offset
         return position
 
-    def _capture_transport_orientation(self) -> None:
+    def _get_current_end_effector_orientation(
+        self,
+    ) -> np.ndarray:
         end_effector = getattr(
             self.robot,
             "end_effector",
@@ -365,16 +385,61 @@ class M0609StateMachine:
 
         if orientation.shape != (4,):
             raise RuntimeError(
-                "invalid transport orientation shape: "
+                "invalid end-effector orientation shape: "
                 f"{orientation.shape}"
             )
 
         if not np.all(np.isfinite(orientation)):
             raise RuntimeError(
-                "transport orientation contains invalid values"
+                "end-effector orientation contains invalid values"
             )
 
-        self._transport_orientation = orientation.copy()
+        return orientation.copy()
+
+    def _set_pre_pick_transit_target(self) -> None:
+        self._pre_pick_transit_orientation = (
+            self._get_current_end_effector_orientation()
+        )
+
+        self._set_move_target(
+            self._require_task().transit_position,
+            self._pre_pick_transit_orientation,
+        )
+
+        print(
+            f"[PRE_PICK {self.robot_id}] "
+            "집기 전 경유지 이동: "
+            f"position="
+            f"{self._require_task().transit_position.round(4)}, "
+            f"orientation="
+            f"{self._pre_pick_transit_orientation.round(5)}",
+            flush=True,
+        )
+
+    def _set_post_place_transit_target(self) -> None:
+        self._post_place_transit_orientation = (
+            self._get_current_end_effector_orientation()
+        )
+
+        self._set_move_target(
+            self._require_task().transit_position,
+            self._post_place_transit_orientation,
+        )
+
+        print(
+            f"[POST_PLACE {self.robot_id}] "
+            "PLACE 후 경유지 이동: "
+            f"position="
+            f"{self._require_task().transit_position.round(4)}, "
+            f"orientation="
+            f"{self._post_place_transit_orientation.round(5)}",
+            flush=True,
+        )
+
+    def _capture_transport_orientation(self) -> None:
+        self._transport_orientation = (
+            self._get_current_end_effector_orientation()
+        )
 
         print(
             f"[TRANSPORT {self.robot_id}] "
@@ -611,9 +676,14 @@ class M0609StateMachine:
             )
         )
 
-        self._pick_phase = PickPhase.PICKING
+        self._pick_phase = PickPhase.MOVE_PRE_PICK_TRANSIT
         self._transport_orientation = None
+        self._pre_pick_transit_orientation = None
+        self._post_place_transit_orientation = None
+        self._joint1_before_pre_pick = None
+
         self.pick_place_controller.reset()
+        self._set_pre_pick_transit_target()
 
         print(
             f"[PICK] tray={self._active_tray_id}, "
@@ -719,7 +789,53 @@ class M0609StateMachine:
                 "Dynamic pick pose is missing"
             )
 
-        if self._pick_phase == PickPhase.PICKING:
+        if (
+            self._pick_phase
+            == PickPhase.MOVE_PRE_PICK_TRANSIT
+        ):
+            self.robot.apply_action(
+                self.move_controller.forward()
+            )
+
+            if self.move_controller.is_done():
+                current = np.asarray(
+                    self.robot.get_joint_positions(),
+                    dtype=np.float64,
+                )
+
+                self._joint1_before_pre_pick = float(
+                    current[0]
+                )
+
+                # 기존 운반용 180도 회전과 반대 방향으로 90도 회전.
+                pre_pick_delta = (
+                    -0.5
+                    * self._require_task().joint1_delta_rad
+                )
+
+                self._start_joint1_rotation(
+                    self._joint1_before_pre_pick
+                    + pre_pick_delta
+                )
+                self._pick_phase = (
+                    PickPhase.ROTATE_PRE_PICK
+                )
+
+        elif (
+            self._pick_phase
+            == PickPhase.ROTATE_PRE_PICK
+        ):
+            if self._step_joint1_rotation():
+                self.pick_place_controller.reset()
+                self._pick_phase = PickPhase.PICKING
+
+                print(
+                    f"[PRE_PICK {self.robot_id}] "
+                    "반대 방향 90도 회전 완료, PICK 시작",
+                    flush=True,
+                )
+
+        elif self._pick_phase == PickPhase.PICKING:
             event = (
                 self.pick_place_controller
                 .get_current_event()
@@ -979,8 +1095,46 @@ class M0609StateMachine:
             )
 
             if self.move_controller.is_done():
-                # 트레이 위 수직 상승이 끝나면 작업 데이터는 정리한다.
-                # 경유지로 다시 이동하지 않고 RETURN_HOME으로 전환한다.
+                # 집기 전 동작을 역순으로 수행한다.
+                # PLACE 위치 -> 경유지 -> 집기 전 90도 회전 원복
+                # -> RETURN_HOME
+                self._set_post_place_transit_target()
+                self._place_phase = (
+                    PlacePhase.MOVE_POST_PLACE_TRANSIT
+                )
+
+        elif (
+            self._place_phase
+            == PlacePhase.MOVE_POST_PLACE_TRANSIT
+        ):
+            self.robot.apply_action(
+                self.move_controller.forward()
+            )
+
+            if self.move_controller.is_done():
+                if self._joint1_before_pre_pick is None:
+                    raise RuntimeError(
+                        "pre-pick joint1 return angle is missing"
+                    )
+
+                self._start_joint1_rotation(
+                    self._joint1_before_pre_pick
+                )
+                self._place_phase = (
+                    PlacePhase.ROTATE_PRE_PICK_BACK
+                )
+
+        elif (
+            self._place_phase
+            == PlacePhase.ROTATE_PRE_PICK_BACK
+        ):
+            if self._step_joint1_rotation():
+                print(
+                    f"[POST_PLACE {self.robot_id}] "
+                    "집기 전 90도 회전 원복 완료",
+                    flush=True,
+                )
+
                 self._clear_active_tray()
                 self._change_state(
                     M0609State.RETURN_HOME
@@ -1069,9 +1223,13 @@ class M0609StateMachine:
         self._place_tool_orientation = None
         self._transport_orientation = None
 
+        self._joint1_before_pre_pick = None
         self._joint1_before_tracking = None
         self._joint1_target = None
         self._safe_tracking_joint_positions = None
+
+        self._pre_pick_transit_orientation = None
+        self._post_place_transit_orientation = None
 
         self._release_wait_frames = 0
         self._release_stable_frames = 0
@@ -1109,10 +1267,11 @@ class M0609StateMachine:
         self._state = M0609State.IDLE
         self._state_entered = True
 
-        self._pick_phase = PickPhase.PICKING
+        self._pick_phase = PickPhase.MOVE_PRE_PICK_TRANSIT
         self._place_phase = PlacePhase.MOVE_TRANSIT
 
-        # 좌우 우회 경로 전용 상태도 Play 재시작 시 초기화한다.
+        # 집기 전/운반 경로 상태도 Play 재시작 시 초기화한다.
+        self._joint1_before_pre_pick = None
         self._joint1_before_tracking = None
         self._joint1_target = None
         self._safe_tracking_joint_positions = None

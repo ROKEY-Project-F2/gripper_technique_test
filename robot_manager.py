@@ -1,9 +1,10 @@
 # robot_manager.py
-
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Dict, Mapping, Optional, Sequence, Tuple
+
+import numpy as np
 
 from robot_runtime import RobotProfile, RobotTask
 
@@ -18,74 +19,77 @@ class ManagedRobot:
 
 class RobotManager:
     """
-    여러 로봇의 작업 배정과 공용 경유지 락을 관리한다.
+    여러 로봇의 작업 배정과 트레이 PICK/PLACE 구역 락을 관리한다.
 
-    경로 선택 규칙:
-      1. 각 로봇은 preferred_route를 먼저 시도한다.
-      2. preferred_route가 잠겨 있으면 fallback_route를 사용한다.
-      3. 작업에 선택된 경로는 RobotTask에 저장되어 왕복 내내 유지된다.
+    삭제된 기능:
+    - TRANSIT_2 공용 경로
+    - 경로 우선순위
+    - fallback 경로
+    - 경유지 락
+    - route owner
+    - 경유지 대기 큐
 
-    현재 설정:
-      Robot A: TRANSIT_2 우선, TRANSIT_1 대체
-      Robot B: TRANSIT_2 우선, TRANSIT_3 대체
-
-    TRANSIT_2 락은 작업 배정 시 획득하고,
-    트레이 반환이 끝나 상태 머신의 current_task가 제거될 때 해제한다.
-    RETURN_HOME과 IDLE 복귀는 락 점유 범위에 포함하지 않는다.
+    유지되는 기능:
+    - 두 로봇 모두 Tray 0~5 접근
+    - 가까운 IDLE 로봇 선택
+    - 거리 동률이면 Robot B 우선
+    - 신규 트레이 PICK/PLACE 구역 락
+    - 신규 락은 큐 없이 단순 차단
     """
 
     def __init__(
         self,
         *,
-        routes: Mapping[
-            str,
-            Tuple[
-                Sequence[float],
-                Sequence[float],
-                float,
-            ],
+        tray_positions: Mapping[
+            int,
+            Sequence[float],
         ],
-        locked_routes: Sequence[str] = (),
         shared_trays: Sequence[int] = (),
     ) -> None:
         self._robots: Dict[str, ManagedRobot] = {}
 
-        self._routes = {
-            str(route_id).strip().upper(): (
-                tuple(float(value) for value in position),
-                tuple(float(value) for value in orientation),
-                float(joint1_delta_rad),
-            )
-            for route_id, (
+        self._tray_positions = {
+            int(tray_id): np.asarray(
                 position,
-                orientation,
-                joint1_delta_rad,
-            ) in routes.items()
+                dtype=np.float64,
+            ).copy()
+            for tray_id, position
+            in tray_positions.items()
         }
 
-        self._locked_routes = frozenset(
-            str(route_id).strip().upper()
-            for route_id in locked_routes
-        )
+        for tray_id, position in self._tray_positions.items():
+            if position.shape != (3,):
+                raise ValueError(
+                    f"Tray {tray_id} position "
+                    "must have shape (3,)"
+                )
 
-        unknown_locked_routes = (
-            self._locked_routes
-            - self._routes.keys()
-        )
-
-        if unknown_locked_routes:
-            raise ValueError(
-                "잠금 대상 경로가 routes에 없습니다: "
-                f"{sorted(unknown_locked_routes)}"
-            )
-
-        # route_id -> robot_id
-        self._route_owners: Dict[str, str] = {}
+            if not np.all(np.isfinite(position)):
+                raise ValueError(
+                    f"Tray {tray_id} position "
+                    "must be finite"
+                )
 
         self._shared_trays = frozenset(
             int(value)
             for value in shared_trays
         )
+
+        unknown_shared_trays = (
+            self._shared_trays
+            - self._tray_positions.keys()
+        )
+
+        if unknown_shared_trays:
+            raise ValueError(
+                "공용 구역 대상 트레이가 "
+                "tray_positions에 없습니다: "
+                f"{sorted(unknown_shared_trays)}"
+            )
+
+        # 신규 PICK/PLACE 구역 락.
+        # 큐를 두지 않고 현재 소유자만 저장한다.
+        self._tray_zone_owner: Optional[str] = None
 
     def register_robot(
         self,
@@ -100,15 +104,17 @@ class RobotManager:
                 f"Robot {robot_id} is already registered"
             )
 
-        for route_id in (
-            profile.preferred_route,
-            profile.fallback_route,
-        ):
-            if route_id not in self._routes:
-                raise KeyError(
-                    f"Robot {robot_id} route "
-                    f"{route_id} is not registered"
-                )
+        unknown_trays = (
+            profile.reachable_trays
+            - self._tray_positions.keys()
+        )
+
+        if unknown_trays:
+            raise KeyError(
+                f"Robot {robot_id} reachable trays "
+                "are not registered: "
+                f"{sorted(unknown_trays)}"
+            )
 
         self._robots[robot_id] = ManagedRobot(
             profile=profile,
@@ -119,46 +125,17 @@ class RobotManager:
         print(
             f"[Manager] registered robot={robot_id}, "
             f"reachable={sorted(profile.reachable_trays)}, "
-            f"preferred={profile.preferred_route}, "
-            f"fallback={profile.fallback_route}",
+            f"route={profile.route_id}, "
+            f"transit={profile.transit_position.round(4)}, "
+            f"selection_position="
+            f"{profile.selection_position.round(4)}",
             flush=True,
         )
-
-    def _find_target_robot(
-        self,
-        tray_id: int,
-    ) -> Optional[ManagedRobot]:
-        """
-        tray_id를 담당하는 로봇만 찾는다.
-
-        이 함수에서는 상태를 보지 않는다.
-        대상 로봇 결정과 명령 수락 가능 여부 검사를 분리한다.
-        """
-        candidates = [
-            managed
-            for managed in self._robots.values()
-            if tray_id in managed.profile.reachable_trays
-        ]
-
-        if not candidates:
-            return None
-
-        return sorted(
-            candidates,
-            key=lambda item: item.profile.robot_id,
-        )[0]
 
     def _can_accept_command(
         self,
         managed: ManagedRobot,
     ) -> Tuple[bool, str]:
-        """
-        현재 단계에서는 IDLE 상태인 로봇만 새 명령을 받을 수 있다.
-
-        PICK, TRACKING, PLACE, RETURN_HOME 등 다른 상태에서는
-        매니저 선에서 즉시 차단하며 상태 머신이나 경로 락에
-        명령을 전달하지 않는다.
-        """
         current_state = (
             managed.state_machine.state_name
         )
@@ -166,45 +143,105 @@ class RobotManager:
         if current_state != "IDLE":
             return (
                 False,
-                f"Robot {managed.profile.robot_id} is busy: "
-                f"state={current_state}",
+                f"Robot {managed.profile.robot_id} "
+                f"is busy: state={current_state}",
             )
 
         if managed.active_task is not None:
             return (
                 False,
-                f"Robot {managed.profile.robot_id} is busy: "
-                "active_task exists",
+                f"Robot {managed.profile.robot_id} "
+                "is busy: active_task exists",
             )
 
         return True, "accepted"
 
-    def _try_acquire_route(
+    def _distance_to_tray(
         self,
         *,
-        route_id: str,
+        managed: ManagedRobot,
+        tray_id: int,
+    ) -> float:
+        tray_position = self._tray_positions[tray_id]
+        robot_position = (
+            managed.profile.selection_position
+        )
+
+        return float(
+            np.linalg.norm(
+                tray_position - robot_position
+            )
+        )
+
+    @staticmethod
+    def _robot_tie_priority(
+        robot_id: str,
+    ) -> int:
+        normalized = str(robot_id).strip().upper()
+
+        if normalized == "B":
+            return 0
+
+        if normalized == "A":
+            return 1
+
+        return 2
+
+    def _find_candidate_robots(
+        self,
+        tray_id: int,
+    ) -> list[ManagedRobot]:
+        candidates: list[ManagedRobot] = []
+
+        for managed in self._robots.values():
+            if (
+                tray_id
+                not in managed.profile.reachable_trays
+            ):
+                continue
+
+            can_accept, _ = self._can_accept_command(
+                managed
+            )
+
+            if not can_accept:
+                continue
+
+            candidates.append(managed)
+
+        candidates.sort(
+            key=lambda managed: (
+                self._distance_to_tray(
+                    managed=managed,
+                    tray_id=tray_id,
+                ),
+                self._robot_tie_priority(
+                    managed.profile.robot_id
+                ),
+                managed.profile.robot_id,
+            )
+        )
+
+        return candidates
+
+    # ========================================================
+    # 신규 트레이 PICK/PLACE 구역 락
+    # ========================================================
+
+    def _try_acquire_tray_zone(
+        self,
+        *,
         robot_id: str,
     ) -> bool:
-        """
-        잠금이 필요 없는 경로는 항상 성공한다.
-
-        잠금 경로는 소유자가 없을 때만 현재 로봇에게 배정한다.
-        같은 로봇의 중복 획득은 성공으로 처리한다.
-        """
-        route_id = str(route_id).strip().upper()
         robot_id = str(robot_id).strip().upper()
-
-        if route_id not in self._locked_routes:
-            return True
-
-        owner = self._route_owners.get(route_id)
+        owner = self._tray_zone_owner
 
         if owner is None:
-            self._route_owners[route_id] = robot_id
+            self._tray_zone_owner = robot_id
 
             print(
-                f"[Manager LOCK] acquired: "
-                f"route={route_id}, robot={robot_id}",
+                "[Manager TRAY-ZONE] acquired: "
+                f"robot={robot_id}",
                 flush=True,
             )
             return True
@@ -212,103 +249,120 @@ class RobotManager:
         if owner == robot_id:
             return True
 
-        print(
-            f"[Manager LOCK] denied: "
-            f"route={route_id}, "
-            f"requester={robot_id}, "
-            f"owner={owner}",
-            flush=True,
-        )
         return False
 
-    def _release_route(
+    def _release_tray_zone(
         self,
         *,
-        route_id: str,
         robot_id: str,
     ) -> None:
-        route_id = str(route_id).strip().upper()
         robot_id = str(robot_id).strip().upper()
-
-        if route_id not in self._locked_routes:
-            return
-
-        owner = self._route_owners.get(route_id)
+        owner = self._tray_zone_owner
 
         if owner is None:
             return
 
         if owner != robot_id:
             print(
-                f"[Manager LOCK] release ignored: "
-                f"route={route_id}, "
+                "[Manager TRAY-ZONE] "
+                "release ignored: "
                 f"requester={robot_id}, "
                 f"owner={owner}",
                 flush=True,
             )
             return
 
-        del self._route_owners[route_id]
+        self._tray_zone_owner = None
 
         print(
-            f"[Manager LOCK] released: "
-            f"route={route_id}, robot={robot_id}",
+            "[Manager TRAY-ZONE] released: "
+            f"robot={robot_id}",
             flush=True,
         )
 
-    def _select_route(
+    def _task_uses_tray_zone(
+        self,
+        managed: ManagedRobot,
+    ) -> bool:
+        task = managed.active_task
+
+        return bool(
+            task is not None
+            and task.uses_shared_zone
+        )
+
+    def _must_hold_tray_zone_before_step(
+        self,
+        managed: ManagedRobot,
+    ) -> bool:
+        if not self._task_uses_tray_zone(managed):
+            return False
+
+        state_name = (
+            managed.state_machine.state_name
+        )
+
+        if (
+            state_name == "IDLE"
+            and managed.active_task is not None
+        ):
+            return True
+
+        return state_name in {
+            "PICK",
+            "PLACE",
+        }
+
+    def _release_tray_zone_after_transition(
         self,
         *,
         managed: ManagedRobot,
-    ) -> Optional[str]:
+        previous_state: str,
+        current_state: str,
+    ) -> None:
         robot_id = managed.profile.robot_id
-        preferred_route = (
-            managed.profile.preferred_route
-        )
 
-        if self._try_acquire_route(
-            route_id=preferred_route,
-            robot_id=robot_id,
+        if (
+            previous_state == "PICK"
+            and current_state == "TRACKING"
         ):
-            return preferred_route
-
-        fallback_route = (
-            managed.profile.fallback_route
-        )
-
-        if self._try_acquire_route(
-            route_id=fallback_route,
-            robot_id=robot_id,
-        ):
-            print(
-                f"[Manager] route fallback: "
-                f"robot={robot_id}, "
-                f"{preferred_route} -> {fallback_route}",
-                flush=True,
+            self._release_tray_zone(
+                robot_id=robot_id
             )
-            return fallback_route
+            return
 
-        return None
+        if (
+            previous_state == "PLACE"
+            and current_state == "RETURN_HOME"
+        ):
+            self._release_tray_zone(
+                robot_id=robot_id
+            )
+
+    # ========================================================
+    # 작업 배정
+    # ========================================================
 
     def _create_task(
         self,
         *,
         managed: ManagedRobot,
         tray_id: int,
-        route_id: str,
     ) -> RobotTask:
-        (
-            position,
-            orientation,
-            joint1_delta_rad,
-        ) = self._routes[route_id]
+        profile = managed.profile
 
         return RobotTask.create(
             tray_id=tray_id,
-            route_id=route_id,
-            transit_position=position,
-            transit_orientation=orientation,
-            joint1_delta_rad=joint1_delta_rad,
+            route_id=profile.route_id,
+            transit_position=(
+                profile.transit_position
+            ),
+            transit_orientation=(
+                profile.transit_orientation
+            ),
+            joint1_delta_rad=(
+                profile.tracking_joint1_delta_rad
+            ),
             uses_shared_zone=(
                 tray_id in self._shared_trays
             ),
@@ -320,76 +374,118 @@ class RobotManager:
     ) -> Tuple[bool, str]:
         tray_index = int(tray_index)
 
-        managed = self._find_target_robot(
-            tray_index
-        )
-
-        if managed is None:
+        if tray_index not in self._tray_positions:
             message = (
-                f"No robot is assigned to tray "
-                f"{tray_index}"
+                f"Unknown tray: {tray_index}"
             )
+
             print(
                 f"[Manager BLOCK] {message}",
                 flush=True,
             )
             return False, message
 
-        can_accept, reason = self._can_accept_command(
-            managed
+        candidates = self._find_candidate_robots(
+            tray_index
         )
 
-        if not can_accept:
+        if not candidates:
+            message = (
+                "No IDLE robot can reach tray "
+                f"{tray_index}"
+            )
+
             print(
-                f"[Manager BLOCK] command rejected: "
-                f"tray={tray_index}, {reason}",
+                f"[Manager BLOCK] {message}",
                 flush=True,
-            )
-            return False, reason
-
-        # 이 아래는 대상 로봇이 IDLE일 때만 실행된다.
-        # 경로 선택, 락 획득, task 생성, 상태 머신 전달 모두
-        # busy 상태에서는 수행되지 않는다.
-        route_id = self._select_route(
-            managed=managed
-        )
-
-        if route_id is None:
-            return (
-                False,
-                f"No available route for "
-                f"Robot {managed.profile.robot_id}",
-            )
-
-        task = self._create_task(
-            managed=managed,
-            tray_id=tray_index,
-            route_id=route_id,
-        )
-
-        accepted, message = (
-            managed.state_machine.assign_task(task)
-        )
-
-        if not accepted:
-            self._release_route(
-                route_id=route_id,
-                robot_id=(
-                    managed.profile.robot_id
-                ),
             )
             return False, message
 
-        managed.active_task = task
+        # 큐를 사용하지 않는다.
+        # 구역 점유 중이면 신규 PICK 요청을 즉시 차단한다.
+        if (
+            tray_index in self._shared_trays
+            and self._tray_zone_owner is not None
+        ):
+            message = (
+                "Tray PICK/PLACE zone is occupied: "
+                f"owner={self._tray_zone_owner}"
+            )
 
-        return (
-            True,
-            f"Robot {managed.profile.robot_id} "
-            f"assigned tray {tray_index} "
-            f"via route {task.route_id}, "
-            f"joint1_delta="
-            f"{task.joint1_delta_rad:.4f} rad",
+            print(
+                "[Manager BLOCK] "
+                f"tray={tray_index}, "
+                f"{message}",
+                flush=True,
+            )
+            return False, message
+
+        for managed in candidates:
+            robot_id = managed.profile.robot_id
+
+            task = self._create_task(
+                managed=managed,
+                tray_id=tray_index,
+            )
+
+            tray_zone_acquired = False
+
+            if task.uses_shared_zone:
+                tray_zone_acquired = (
+                    self._try_acquire_tray_zone(
+                        robot_id=robot_id
+                    )
+                )
+
+                if not tray_zone_acquired:
+                    return (
+                        False,
+                        "Tray PICK/PLACE zone "
+                        "is occupied: "
+                        f"owner="
+                        f"{self._tray_zone_owner}",
+                    )
+
+            accepted, message = (
+                managed.state_machine.assign_task(
+                    task
+                )
+            )
+
+            if not accepted:
+                if tray_zone_acquired:
+                    self._release_tray_zone(
+                        robot_id=robot_id
+                    )
+                continue
+
+            managed.active_task = task
+
+            distance = self._distance_to_tray(
+                managed=managed,
+                tray_id=tray_index,
+            )
+
+            return (
+                True,
+                f"Robot {robot_id} assigned "
+                f"tray {tray_index}, "
+                f"route={task.route_id}, "
+                f"distance={distance:.4f} m, "
+                f"joint1_delta="
+                f"{task.joint1_delta_rad:.4f} rad",
+            )
+
+        message = (
+            f"No robot accepted tray "
+            f"{tray_index}"
         )
+
+        print(
+            f"[Manager BLOCK] {message}",
+            flush=True,
+        )
+        return False, message
 
     def request_move(
         self,
@@ -405,6 +501,23 @@ class RobotManager:
 
     def step(self) -> None:
         for managed in self._robots.values():
+            robot_id = managed.profile.robot_id
+            previous_state = (
+                managed.state_machine.state_name
+            )
+
+            if self._must_hold_tray_zone_before_step(
+                managed
+            ):
+                acquired = (
+                    self._try_acquire_tray_zone(
+                        robot_id=robot_id
+                    )
+                )
+
+                if not acquired:
+                    continue
+
             managed.state_machine.step()
 
             current_state = (
@@ -413,17 +526,20 @@ class RobotManager:
 
             if current_state != managed.last_state:
                 print(
-                    f"[Manager "
-                    f"{managed.profile.robot_id}] "
+                    f"[Manager {robot_id}] "
                     f"state: {managed.last_state} "
                     f"-> {current_state}",
                     flush=True,
                 )
+
                 managed.last_state = current_state
 
-            # 상태 머신은 트레이 반환과 LIFT가 끝난 뒤
-            # current_task를 제거하고 RETURN_HOME으로 전환한다.
-            # 이 시점에 공용 경유지 락을 해제한다.
+            self._release_tray_zone_after_transition(
+                managed=managed,
+                previous_state=previous_state,
+                current_state=current_state,
+            )
+
             if (
                 managed.active_task is not None
                 and (
@@ -433,17 +549,13 @@ class RobotManager:
             ):
                 completed_task = managed.active_task
 
-                self._release_route(
-                    route_id=completed_task.route_id,
-                    robot_id=(
-                        managed.profile.robot_id
-                    ),
+                self._release_tray_zone(
+                    robot_id=robot_id
                 )
 
                 print(
-                    f"[Manager "
-                    f"{managed.profile.robot_id}] "
-                    f"task complete: "
+                    f"[Manager {robot_id}] "
+                    "task complete: "
                     f"tray={completed_task.tray_id}, "
                     f"route={completed_task.route_id}",
                     flush=True,
@@ -452,7 +564,7 @@ class RobotManager:
                 managed.active_task = None
 
     def reset(self) -> None:
-        self._route_owners.clear()
+        self._tray_zone_owner = None
 
         for managed in self._robots.values():
             managed.active_task = None
@@ -462,15 +574,12 @@ class RobotManager:
             )
 
         print(
-            "[Manager] reset: all route locks cleared",
+            "[Manager] reset: "
+            "tray-zone lock cleared",
             flush=True,
         )
 
-    def get_route_owner(
+    def get_tray_zone_owner(
         self,
-        route_id: str,
     ) -> Optional[str]:
-        """디버깅용 경로 락 소유자 조회."""
-        return self._route_owners.get(
-            str(route_id).strip().upper()
-        )
+        return self._tray_zone_owner

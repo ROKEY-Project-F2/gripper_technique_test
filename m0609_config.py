@@ -1,5 +1,4 @@
 # m0609_config.py
-
 from pathlib import Path
 
 
@@ -9,6 +8,7 @@ _THIS_DIR = Path(__file__).resolve().parent
 # ============================================================
 # 전체 Scene USD
 # ============================================================
+
 ROBOT_USD_PATH = str(
     _THIS_DIR
     / "Collected_full_scene"
@@ -19,6 +19,7 @@ ROBOT_USD_PATH = str(
 # ============================================================
 # Robot A / Robot B Prim 및 Scene 이름
 # ============================================================
+
 ROBOT_A_PRIM_PATH = "/World/m0609_01"
 ROBOT_A_SCENE_NAME = "m0609_robot_a"
 
@@ -31,6 +32,7 @@ EE_LINK_NAME = "link_6"
 # ============================================================
 # Surface Gripper 설정
 # ============================================================
+
 def _surface_gripper_paths(
     robot_prim_path: str,
 ):
@@ -72,6 +74,7 @@ SURFACE_GRIPPER_WRITE_STATUS_TO_USD = True
 # ============================================================
 # 로봇 Drive 설정
 # ============================================================
+
 DRIVE_STIFFNESS = 1e8
 DRIVE_DAMPING = 1e4
 DRIVE_MAX_FORCE = 1e8
@@ -80,8 +83,10 @@ DRIVE_MAX_FORCE = 1e8
 # ============================================================
 # RMPflow 설정
 # ============================================================
+
 RMPFLOW_DIR = str(
-    _THIS_DIR / "rmpflow"
+    _THIS_DIR
+    / "rmpflow"
 )
 
 M0609_URDF_PATH = str(
@@ -110,8 +115,10 @@ M0609_RMPFLOW_CONFIG_PATH = str(
 # 실제 Robot A/B base pose는 main.py에서 각 Prim의
 # world pose를 읽어 자동으로 계산한다.
 # ============================================================
+
 CUROBO_ROBOT_CONFIG_PATH = str(
-    _THIS_DIR / "m0609_v1.yml"
+    _THIS_DIR
+    / "m0609_v1.yml"
 )
 
 TRACKING_TOOL_ORIENTATION = (
@@ -130,6 +137,7 @@ TRACKING_USE_MPC = True
 # ============================================================
 # 실제 트레이 / 수술 도구 동적 생성 설정
 # ============================================================
+
 TABLE_HEIGHT = 1.0
 
 TRAY_USD_PATH = str(
@@ -169,14 +177,6 @@ TOOL_USDS = (
         TOOL_DIR
         / "sm_knife_a01_01.usd"
     ),
-    str(
-        TOOL_DIR
-        / "sm_ligatureneedle_a01_01.usd"
-    ),
-    str(
-        TOOL_DIR
-        / "sm_mallet_a01_01.usd"
-    ),
 )
 
 TOOL_NAMES = (
@@ -186,8 +186,6 @@ TOOL_NAMES = (
     "겸자",
     "톱",
     "메스",
-    "갈고리",
-    "망치",
 )
 
 TOOL_DROP_HEIGHT = 0.05
@@ -200,107 +198,131 @@ TOOL_SCALES = (
     (0.0075, 0.0075, 0.0075),
     (0.0035, 0.0035, 0.0035),
     (0.0040, 0.0040, 0.0040),
-    (0.0075, 0.0075, 0.0075),
-    (0.0045, 0.0045, 0.0045),
 )
 
 TRAY_TOP_Z = 0.0186
 TRAY_Z = 1.05
 
 TRAY_ORIENTATION = (
-    0.7071,
     0.0,
     0.0,
-    0.7071,
+    0.0,
+    1.0,
 )
 
+# 새 2열×3행 배치.
+#
+# 화면 기준:
+#
+#   4  5
+#   2  3
+# A 0  1 B
+#
+# 업로드된 full_scene.usda 기준:
+# Robot A = (-0.55, 0.50, 1.00)
+# Robot B = ( 0.55, 0.50, 1.00)
+#
+# Robot A/B의 y=0.50이 0·1행과 2·3행 사이에 오도록
+# 첫 행은 y=0.35, 둘째 행은 y=0.65로 배치한다.
+# 행 간격은 0.25 m, 열 중심 간격은 0.25 m이다.
+#
 TRAY_SPAWN_POSITIONS = {
-    # 전체 배열 폭을 줄여 트레이를 중앙 쪽으로 배치한다.
-    # x 간격은 0.40 m로 일정하게 유지한다.
-    #
-    #   1    3    5    7
-    #   0    2    4    6
-    #
-    0: (-0.60, 0.55, TRAY_Z),
-    1: (-0.60, 0.85, TRAY_Z),
-    2: (-0.20, 0.55, TRAY_Z),
-    3: (-0.20, 0.85, TRAY_Z),
-    4: (0.20, 0.55, TRAY_Z),
-    5: (0.20, 0.85, TRAY_Z),
-    6: (0.60, 0.55, TRAY_Z),
-    7: (0.60, 0.85, TRAY_Z),
+    0: (-0.125, 0.40, TRAY_Z),
+    1: ( 0.125, 0.40, TRAY_Z),
+    2: (-0.125, 0.65, TRAY_Z),
+    3: ( 0.125, 0.65, TRAY_Z),
+    4: (-0.125, 0.90, TRAY_Z),
+    5: ( 0.125, 0.90, TRAY_Z),
 }
 
+# 두 로봇 모두 모든 트레이에 접근할 수 있다.
 ROBOT_A_SUPPORTED_TRAY_COMMANDS = (
     0,
     1,
     2,
     3,
+    4,
+    5,
 )
 
 ROBOT_B_SUPPORTED_TRAY_COMMANDS = (
+    0,
+    1,
+    2,
+    3,
     4,
     5,
-    6,
-    7,
 )
 
 
+
 # ============================================================
-# 경유지 설정
+# IDLE 관절 자세
 #
-# 경유지 2의 x, y는 main.py에서 Robot A와 Robot B 베이스의
-# 정확한 중점으로 계산한다.
+# full_scene(3).usda에 저장된 현재 관절 targetPosition과 동일하다.
+# 단위는 degree이며 main.py에서 radian으로 변환해서 사용한다.
 #
-#   TRANSIT_2.xy = (Robot A base.xy + Robot B base.xy) / 2
-#
-# 경유지 1과 3은 각 로봇 베이스를 중심으로 경유지 2를
-# 반대편에 같은 거리만큼 반사해 계산한다.
-#
-#   TRANSIT_1.xy = 2 * Robot A base.xy - TRANSIT_2.xy
-#   TRANSIT_3.xy = 2 * Robot B base.xy - TRANSIT_2.xy
-#
-# 세 경유지의 높이는 동일하게 유지한다.
+# Robot A = /World/m0609_01
+# Robot B = /World/m0609
 # ============================================================
+
+ROBOT_A_IDLE_JOINT_POSITIONS_DEG = (
+    88.0,
+    0.1,
+    -90.0,
+    0.0,
+    -96.0,
+    0.0,
+)
+
+ROBOT_B_IDLE_JOINT_POSITIONS_DEG = (
+    -96.0,
+    3.7,
+    88.1,
+    0.0,
+    100.200005,
+    -300.6,
+)
+
+# ============================================================
+# 로봇 위쪽 중간 경유지 설정
+#
+# 현재 배치:
+#
+#     4 5
+#   a 2 3 b
+#   A 0 1 B
+#
+# a, b는 각 로봇 베이스를 기준으로 Y축 +0.30m 지점이다.
+# X 좌표는 각 로봇 베이스와 동일하게 유지한다.
+#
+# 중간 경유지 도착 후 각 로봇은 바깥쪽 방향으로 180도 회전한다.
+# Robot A: +180도
+# Robot B: -180도
+# ============================================================
+
 TRANSIT_HEIGHT = 1.35
 
-# 경유지 도착 후 TRACKING 시작 전 첫 번째 관절 회전량.
-# Robot A/B 설치 방향이 반대이면 부호를 서로 바꾼다.
-ROBOT_A_TRACKING_JOINT1_DELTA_DEG = 90.0
-ROBOT_B_TRACKING_JOINT1_DELTA_DEG = -90.0
+ROBOT_TRANSIT_Y_OFFSET = 0.30
 
-# joint1 회전 완료 판정 허용 오차.
+ROBOT_A_TRACKING_JOINT1_DELTA_DEG = 180.0
+ROBOT_B_TRACKING_JOINT1_DELTA_DEG = -180.0
+
 JOINT1_TURN_TOLERANCE_DEG = 1.0
+JOINT1_TURN_MAX_STEP_DEG = 1.00
 
-# joint1 회전 시 한 simulation step에서 허용할 최대 회전량.
-# main loop가 약 100 Hz라면 0.25 deg/step은 약 25 deg/s이다.
-JOINT1_TURN_MAX_STEP_DEG = 0.50
-
-# PLACE 시 회전 완료 당시의 전체 관절 자세로 복귀할 때
-# 한 simulation step에서 각 관절이 움직일 수 있는 최대 각도.
 SAFE_JOINT_RETURN_MAX_STEP_DEG = 0.35
-
-# 안전 관절 자세 도착 판정 허용 오차.
 SAFE_JOINT_RETURN_TOLERANCE_DEG = 1.0
 
-# PLACE 완료 후 최초 IDLE 관절 자세로 복귀할 때,
-# 한 simulation step에서 각 관절이 움직일 수 있는 최대 각도.
-# 값이 작을수록 천천히 복귀한다.
 RETURN_HOME_MAX_STEP_DEG = 0.20
-
-# RETURN_HOME 중 엔드이펙터 방향을 복원하는 손목 관절
-# J4~J6의 최대 이동량. J1~J3보다 빠르게 복귀시킨다.
 RETURN_HOME_WRIST_MAX_STEP_DEG = 1.00
-
-# 최초 관절 자세 도착 판정 허용 오차.
 RETURN_HOME_TOLERANCE_DEG = 1.0
-
-
 
 
 # ============================================================
 # PICK / PLACE 설정
 # ============================================================
+
 PICK_EVENTS_DT = (
     0.008,
     0.005,
@@ -321,6 +343,7 @@ PICK_DEFAULT_EE_OFFSET = (
 )
 
 PICK_APPROACH_Z_CORRECTION = 0.032
+
 TRANSPORT_Z_OFFSET = 0.10
 
 PLACE_LINK6_ABOVE_TRAY = 0.136
@@ -337,12 +360,14 @@ PLACE_RELEASE_TIMEOUT_FRAMES = 120
 # ============================================================
 # 일반 제어 설정
 # ============================================================
+
 INITIAL_SETTLING_FRAMES = 30
 
 
 # ============================================================
 # 설정 파일 검증
 # ============================================================
+
 _REQUIRED_FILES = [
     (
         "ROBOT_USD_PATH",
