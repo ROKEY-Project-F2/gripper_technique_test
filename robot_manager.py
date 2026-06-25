@@ -124,22 +124,20 @@ class RobotManager:
             flush=True,
         )
 
-    def _select_robot(
+    def _find_target_robot(
         self,
         tray_id: int,
     ) -> Optional[ManagedRobot]:
+        """
+        tray_id를 담당하는 로봇만 찾는다.
+
+        이 함수에서는 상태를 보지 않는다.
+        대상 로봇 결정과 명령 수락 가능 여부 검사를 분리한다.
+        """
         candidates = [
             managed
             for managed in self._robots.values()
-            if (
-                tray_id
-                in managed.profile.reachable_trays
-                and (
-                    managed.state_machine.state_name
-                    == "IDLE"
-                )
-                and managed.active_task is None
-            )
+            if tray_id in managed.profile.reachable_trays
         ]
 
         if not candidates:
@@ -149,6 +147,37 @@ class RobotManager:
             candidates,
             key=lambda item: item.profile.robot_id,
         )[0]
+
+    def _can_accept_command(
+        self,
+        managed: ManagedRobot,
+    ) -> Tuple[bool, str]:
+        """
+        현재 단계에서는 IDLE 상태인 로봇만 새 명령을 받을 수 있다.
+
+        PICK, TRACKING, PLACE, RETURN_HOME 등 다른 상태에서는
+        매니저 선에서 즉시 차단하며 상태 머신이나 경로 락에
+        명령을 전달하지 않는다.
+        """
+        current_state = (
+            managed.state_machine.state_name
+        )
+
+        if current_state != "IDLE":
+            return (
+                False,
+                f"Robot {managed.profile.robot_id} is busy: "
+                f"state={current_state}",
+            )
+
+        if managed.active_task is not None:
+            return (
+                False,
+                f"Robot {managed.profile.robot_id} is busy: "
+                "active_task exists",
+            )
+
+        return True, "accepted"
 
     def _try_acquire_route(
         self,
@@ -291,17 +320,36 @@ class RobotManager:
     ) -> Tuple[bool, str]:
         tray_index = int(tray_index)
 
-        managed = self._select_robot(
+        managed = self._find_target_robot(
             tray_index
         )
 
         if managed is None:
-            return (
-                False,
-                "No idle robot can reach "
-                f"tray {tray_index}",
+            message = (
+                f"No robot is assigned to tray "
+                f"{tray_index}"
             )
+            print(
+                f"[Manager BLOCK] {message}",
+                flush=True,
+            )
+            return False, message
 
+        can_accept, reason = self._can_accept_command(
+            managed
+        )
+
+        if not can_accept:
+            print(
+                f"[Manager BLOCK] command rejected: "
+                f"tray={tray_index}, {reason}",
+                flush=True,
+            )
+            return False, reason
+
+        # 이 아래는 대상 로봇이 IDLE일 때만 실행된다.
+        # 경로 선택, 락 획득, task 생성, 상태 머신 전달 모두
+        # busy 상태에서는 수행되지 않는다.
         route_id = self._select_route(
             managed=managed
         )

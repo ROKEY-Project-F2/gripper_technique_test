@@ -64,7 +64,9 @@ class M0609StateMachine:
         joint1_turn_max_step_rad: float,
         safe_joint_return_max_step_rad: float = np.deg2rad(0.35),
         safe_joint_return_tolerance_rad: float = np.deg2rad(1.0),
-        idle_joint_tolerance: float = 0.01,
+        return_home_max_step_rad: float = np.deg2rad(0.20),
+        return_home_wrist_max_step_rad: float = np.deg2rad(0.60),
+        idle_joint_tolerance: float = np.deg2rad(1.0),
     ) -> None:
         self.robot_id = str(robot_id).strip().upper()
         self.robot = robot
@@ -87,7 +89,23 @@ class M0609StateMachine:
                 "idle_joint_positions must be a finite 1-D array"
             )
 
+        self.return_home_max_step_rad = float(
+            return_home_max_step_rad
+        )
+        self.return_home_wrist_max_step_rad = float(
+            return_home_wrist_max_step_rad
+        )
         self.idle_joint_tolerance = float(idle_joint_tolerance)
+
+        if self.return_home_max_step_rad <= 0.0:
+            raise ValueError(
+                "return_home_max_step_rad must be > 0"
+            )
+
+        if self.return_home_wrist_max_step_rad <= 0.0:
+            raise ValueError(
+                "return_home_wrist_max_step_rad must be > 0"
+            )
 
         if self.idle_joint_tolerance <= 0.0:
             raise ValueError(
@@ -209,6 +227,10 @@ class M0609StateMachine:
         self._place_reference_orientation: Optional[np.ndarray] = None
         self._place_tool_orientation: Optional[np.ndarray] = None
 
+        # 흡착 완료 순간의 실제 엔드이펙터 자세.
+        # 정방향/반환 경유지 이동에서 동일하게 유지한다.
+        self._transport_orientation: Optional[np.ndarray] = None
+
         self._last_hand_mode_sequence = -1
         self._tracking_error_reported = False
 
@@ -322,16 +344,61 @@ class M0609StateMachine:
         position[2] += self.transport_z_offset
         return position
 
+    def _capture_transport_orientation(self) -> None:
+        end_effector = getattr(
+            self.robot,
+            "end_effector",
+            None,
+        )
+
+        if end_effector is None:
+            raise RuntimeError(
+                "robot.end_effector is not available"
+            )
+
+        _, orientation = end_effector.get_world_pose()
+
+        orientation = np.asarray(
+            orientation,
+            dtype=np.float64,
+        )
+
+        if orientation.shape != (4,):
+            raise RuntimeError(
+                "invalid transport orientation shape: "
+                f"{orientation.shape}"
+            )
+
+        if not np.all(np.isfinite(orientation)):
+            raise RuntimeError(
+                "transport orientation contains invalid values"
+            )
+
+        self._transport_orientation = orientation.copy()
+
+        print(
+            f"[TRANSPORT {self.robot_id}] "
+            "흡착 완료 자세 저장: "
+            f"{self._transport_orientation.round(5)}",
+            flush=True,
+        )
+
     def _set_transit_target(self) -> None:
+        if self._transport_orientation is None:
+            raise RuntimeError(
+                "transport orientation is not captured"
+            )
+
         self._set_move_target(
             self._get_transport_position(),
-            self._require_task().transit_orientation,
+            self._transport_orientation,
         )
 
         print(
             f"[TRANSIT {self.robot_id}] "
             f"route={self._require_task().route_id}, "
-            f"position={self._get_transport_position().round(4)}",
+            f"position={self._get_transport_position().round(4)}, "
+            f"orientation={self._transport_orientation.round(5)}",
             flush=True,
         )
 
@@ -545,6 +612,7 @@ class M0609StateMachine:
         )
 
         self._pick_phase = PickPhase.PICKING
+        self._transport_orientation = None
         self.pick_place_controller.reset()
 
         print(
@@ -678,12 +746,13 @@ class M0609StateMachine:
             self.robot.apply_action(actions)
 
             if event >= 4:
+                self._capture_transport_orientation()
                 self._set_transit_target()
                 self._pick_phase = PickPhase.MOVE_TRANSIT
 
                 print(
                     f"[PICK {self.robot_id}] "
-                    "흡착 완료, 경유지 이동",
+                    "흡착 완료, 저장 자세 유지하며 경유지 이동",
                     flush=True,
                 )
 
@@ -953,9 +1022,37 @@ class M0609StateMachine:
             )
             return
 
+        error = (
+            self.idle_joint_positions
+            - current_joint_positions
+        )
+
+        # J1~J3는 기존 복귀 속도를 유지한다.
+        # 엔드이펙터 방향을 만드는 J4~J6만 더 빠르게 복귀한다.
+        max_step = np.full_like(
+            error,
+            self.return_home_max_step_rad,
+            dtype=np.float64,
+        )
+
+        if max_step.size >= 6:
+            max_step[3:6] = (
+                self.return_home_wrist_max_step_rad
+            )
+
+        step = np.clip(
+            error,
+            -max_step,
+            max_step,
+        )
+
+        next_joint_positions = (
+            current_joint_positions + step
+        )
+
         self.robot.apply_action(
             ArticulationAction(
-                joint_positions=self.idle_joint_positions,
+                joint_positions=next_joint_positions,
             )
         )
 
@@ -970,6 +1067,7 @@ class M0609StateMachine:
         self._place_reference_position = None
         self._place_reference_orientation = None
         self._place_tool_orientation = None
+        self._transport_orientation = None
 
         self._joint1_before_tracking = None
         self._joint1_target = None
@@ -1018,6 +1116,7 @@ class M0609StateMachine:
         self._joint1_before_tracking = None
         self._joint1_target = None
         self._safe_tracking_joint_positions = None
+        self._transport_orientation = None
 
         self._last_hand_mode_sequence = -1
         self._tracking_error_reported = False

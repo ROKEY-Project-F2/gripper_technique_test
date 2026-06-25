@@ -283,6 +283,18 @@ SAFE_JOINT_RETURN_MAX_STEP_DEG = 0.35
 # 안전 관절 자세 도착 판정 허용 오차.
 SAFE_JOINT_RETURN_TOLERANCE_DEG = 1.0
 
+# PLACE 완료 후 최초 IDLE 관절 자세로 복귀할 때,
+# 한 simulation step에서 각 관절이 움직일 수 있는 최대 각도.
+# 값이 작을수록 천천히 복귀한다.
+RETURN_HOME_MAX_STEP_DEG = 0.20
+
+# RETURN_HOME 중 엔드이펙터 방향을 복원하는 손목 관절
+# J4~J6의 최대 이동량. J1~J3보다 빠르게 복귀시킨다.
+RETURN_HOME_WRIST_MAX_STEP_DEG = 1.00
+
+# 최초 관절 자세 도착 판정 허용 오차.
+RETURN_HOME_TOLERANCE_DEG = 1.0
+
 
 
 

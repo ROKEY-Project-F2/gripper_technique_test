@@ -60,6 +60,9 @@ from m0609_config import (
     ROBOT_B_TRACKING_JOINT1_DELTA_DEG,
     ROBOT_B_SCENE_NAME,
     ROBOT_B_SUPPORTED_TRAY_COMMANDS,
+    RETURN_HOME_MAX_STEP_DEG,
+    RETURN_HOME_WRIST_MAX_STEP_DEG,
+    RETURN_HOME_TOLERANCE_DEG,
     SAFE_JOINT_RETURN_MAX_STEP_DEG,
     SAFE_JOINT_RETURN_TOLERANCE_DEG,
     ROBOT_USD_PATH,
@@ -384,6 +387,15 @@ def _create_state_machine(
         ),
         safe_joint_return_tolerance_rad=np.deg2rad(
             SAFE_JOINT_RETURN_TOLERANCE_DEG
+        ),
+        return_home_max_step_rad=np.deg2rad(
+            RETURN_HOME_MAX_STEP_DEG
+        ),
+        return_home_wrist_max_step_rad=np.deg2rad(
+            RETURN_HOME_WRIST_MAX_STEP_DEG
+        ),
+        idle_joint_tolerance=np.deg2rad(
+            RETURN_HOME_TOLERANCE_DEG
         ),
     )
 
