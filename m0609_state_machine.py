@@ -6,12 +6,11 @@ from enum import Enum, auto
 from typing import Optional, Sequence, Tuple
 
 import numpy as np
+from isaacsim.core.utils.types import ArticulationAction
 
 from hand_input import HandInput
+from m0609_dynamic_scene import downward_tool_orientation_for_tray
 from robot_runtime import RobotTask
-from m0609_dynamic_scene import (
-    downward_tool_orientation_for_tray,
-)
 
 
 class M0609State(Enum):
@@ -19,21 +18,24 @@ class M0609State(Enum):
     PICK = auto()
     TRACKING = auto()
     PLACE = auto()
+    RETURN_HOME = auto()
 
 
 class PickPhase(Enum):
     PICKING = auto()
-    MOVE_STAGING = auto()
+    MOVE_TRANSIT = auto()
+    ROTATE_JOINT1_OUT = auto()
 
 
 class PlacePhase(Enum):
-    MOVE_STAGING = auto()
+    MOVE_SAFE_RETURN = auto()
+    ROTATE_JOINT1_BACK = auto()
+    MOVE_TRANSIT = auto()
     MOVE_HIGH = auto()
     MOVE_DOWN = auto()
     RELEASE = auto()
     RELEASE_WAIT = auto()
     LIFT = auto()
-    RETURN_STAGING = auto()
 
 
 class M0609StateMachine:
@@ -44,8 +46,7 @@ class M0609StateMachine:
         robot,
         tray_registry,
         hand_input: HandInput,
-        idle_position: Sequence[float],
-        idle_orientation: Sequence[float],
+        idle_joint_positions: Sequence[float],
         tracking_controller,
         pick_place_controller,
         move_controller,
@@ -59,19 +60,40 @@ class M0609StateMachine:
         place_release_stable_frames: int,
         place_release_retry_interval: int,
         place_release_timeout_frames: int,
+        joint1_turn_tolerance_rad: float,
+        joint1_turn_max_step_rad: float,
+        safe_joint_return_max_step_rad: float = np.deg2rad(0.35),
+        safe_joint_return_tolerance_rad: float = np.deg2rad(1.0),
+        idle_joint_tolerance: float = 0.01,
     ) -> None:
         self.robot_id = str(robot_id).strip().upper()
         self.robot = robot
         self.tray_registry = tray_registry
         self.hand_input = hand_input
-        self.idle_position = np.asarray(
-            idle_position,
+
+        # initialize_robot() 직후 저장한 최초 관절 자세.
+        # 작업 종료 후 RETURN_HOME 상태에서 이 자세로 복귀한다.
+        self.idle_joint_positions = np.asarray(
+            idle_joint_positions,
             dtype=np.float64,
-        )
-        self.idle_orientation = np.asarray(
-            idle_orientation,
-            dtype=np.float64,
-        )
+        ).copy()
+
+        if (
+            self.idle_joint_positions.ndim != 1
+            or self.idle_joint_positions.size == 0
+            or not np.all(np.isfinite(self.idle_joint_positions))
+        ):
+            raise ValueError(
+                "idle_joint_positions must be a finite 1-D array"
+            )
+
+        self.idle_joint_tolerance = float(idle_joint_tolerance)
+
+        if self.idle_joint_tolerance <= 0.0:
+            raise ValueError(
+                "idle_joint_tolerance must be > 0"
+            )
+
         self.tracking_controller = tracking_controller
         self.pick_place_controller = pick_place_controller
         self.move_controller = move_controller
@@ -80,7 +102,6 @@ class M0609StateMachine:
             pick_default_ee_offset,
             dtype=np.float64,
         )
-
         self.pick_approach_z_correction = float(
             pick_approach_z_correction
         )
@@ -109,6 +130,38 @@ class M0609StateMachine:
         self.place_release_timeout_frames = int(
             place_release_timeout_frames
         )
+        self.joint1_turn_tolerance_rad = float(
+            joint1_turn_tolerance_rad
+        )
+        self.joint1_turn_max_step_rad = float(
+            joint1_turn_max_step_rad
+        )
+        self.safe_joint_return_max_step_rad = float(
+            safe_joint_return_max_step_rad
+        )
+        self.safe_joint_return_tolerance_rad = float(
+            safe_joint_return_tolerance_rad
+        )
+
+        if self.joint1_turn_tolerance_rad <= 0.0:
+            raise ValueError(
+                "joint1_turn_tolerance_rad must be > 0"
+            )
+
+        if self.joint1_turn_max_step_rad <= 0.0:
+            raise ValueError(
+                "joint1_turn_max_step_rad must be > 0"
+            )
+
+        if self.safe_joint_return_max_step_rad <= 0.0:
+            raise ValueError(
+                "safe_joint_return_max_step_rad must be > 0"
+            )
+
+        if self.safe_joint_return_tolerance_rad <= 0.0:
+            raise ValueError(
+                "safe_joint_return_tolerance_rad must be > 0"
+            )
 
         if self.place_release_min_wait_frames < 0:
             raise ValueError(
@@ -127,32 +180,35 @@ class M0609StateMachine:
                 "place_release_timeout_frames must be > 0"
             )
 
+        # 최초 실행 시 initialize_robot()으로 이미 최초 관절 자세에 있으므로
+        # 실제 대기 상태인 IDLE에서 시작한다.
         self._state = M0609State.IDLE
         self._state_entered = True
 
         self._pick_phase = PickPhase.PICKING
-        self._place_phase = PlacePhase.MOVE_STAGING
+        self._place_phase = PlacePhase.MOVE_SAFE_RETURN
+
+        # 경유지 도착 당시의 joint1 각도와 회전 목표.
+        self._joint1_before_tracking: Optional[float] = None
+        self._joint1_target: Optional[float] = None
+
+        # joint1 90도 회전이 끝난 순간의 전체 관절 자세.
+        # PLACE 명령 시 Cartesian IK가 아니라 이 관절 자세로 복귀한다.
+        self._safe_tracking_joint_positions: Optional[np.ndarray] = None
 
         self._current_task: Optional[RobotTask] = None
         self._pending_pick_index: Optional[int] = None
         self._active_tray_id: Optional[int] = None
 
-        # PICK 순간 실제 위치/방향
+        # PICK 순간 실제 트레이 pose
         self._pick_position: Optional[np.ndarray] = None
         self._pick_orientation: Optional[np.ndarray] = None
 
-        # 생성 당시 원복 기준 위치/방향
-        self._place_reference_position: Optional[
-            np.ndarray
-        ] = None
-        self._place_reference_orientation: Optional[
-            np.ndarray
-        ] = None
-        self._place_tool_orientation: Optional[
-            np.ndarray
-        ] = None
+        # 생성 당시 원복 기준 pose
+        self._place_reference_position: Optional[np.ndarray] = None
+        self._place_reference_orientation: Optional[np.ndarray] = None
+        self._place_tool_orientation: Optional[np.ndarray] = None
 
-        self._idle_at_staging = False
         self._last_hand_mode_sequence = -1
         self._tracking_error_reported = False
 
@@ -161,7 +217,8 @@ class M0609StateMachine:
         self._release_timeout_reported = False
 
         print(
-            f"[StateMachine {self.robot_id}] 초기 상태: IDLE",
+            f"[StateMachine {self.robot_id}] 초기 상태: IDLE "
+            "(center/side PLACE separated)",
             flush=True,
         )
 
@@ -185,8 +242,8 @@ class M0609StateMachine:
         self._state_entered = True
 
         print(
-            f"[StateMachine {self.robot_id}] {old_state.name} -> "
-            f"{new_state.name}",
+            f"[StateMachine {self.robot_id}] "
+            f"{old_state.name} -> {new_state.name}",
             flush=True,
         )
 
@@ -194,18 +251,33 @@ class M0609StateMachine:
         self,
         task: RobotTask,
     ) -> Tuple[bool, str]:
+        # 최초 관절 자세 복귀가 완료되어 실제 IDLE 상태일 때만
+        # 새로운 작업을 받는다.
         if self._state != M0609State.IDLE:
-            return False, f"Task rejected in {self._state.name}"
+            return (
+                False,
+                f"Task rejected in {self._state.name}",
+            )
 
         if self._current_task is not None:
-            return False, "A task is already assigned"
+            return (
+                False,
+                "A task is already assigned",
+            )
 
         if not self.tray_registry.has_tray(task.tray_id):
-            return False, f"Tray {task.tray_id} is not registered"
+            return (
+                False,
+                f"Tray {task.tray_id} is not registered",
+            )
 
         self._current_task = task
         self._pending_pick_index = task.tray_id
-        return True, f"Tray {task.tray_id} accepted"
+
+        return (
+            True,
+            f"Tray {task.tray_id} accepted",
+        )
 
     def request_move(
         self,
@@ -220,7 +292,10 @@ class M0609StateMachine:
 
     def _require_task(self) -> RobotTask:
         if self._current_task is None:
-            raise RuntimeError("No task is assigned")
+            raise RuntimeError(
+                "No task is assigned"
+            )
+
         return self._current_task
 
     def _set_move_target(
@@ -241,20 +316,159 @@ class M0609StateMachine:
         )
 
     def _get_transport_position(self) -> np.ndarray:
-        """
-        작업 경유 위치에 이동용 Z 오프셋을 적용한다.
+        task = self._require_task()
 
-        PICK 직후 이동과 PLACE 복귀 이동에서 동일하게 사용한다.
-        상태 머신 내부에 특정 좌표를 하드코딩하지 않고,
-        매니저가 전달한 RobotTask 위치를 기준으로 계산한다.
-        """
-        position = (
-            self._require_task()
-            .transit_position
-            .copy()
-        )
+        position = task.transit_position.copy()
         position[2] += self.transport_z_offset
         return position
+
+    def _set_transit_target(self) -> None:
+        self._set_move_target(
+            self._get_transport_position(),
+            self._require_task().transit_orientation,
+        )
+
+        print(
+            f"[TRANSIT {self.robot_id}] "
+            f"route={self._require_task().route_id}, "
+            f"position={self._get_transport_position().round(4)}",
+            flush=True,
+        )
+
+    def _start_joint1_rotation(
+        self,
+        target_rad: float,
+    ) -> None:
+        self._joint1_target = float(target_rad)
+
+        print(
+            f"[JOINT1 {self.robot_id}] "
+            f"target={np.degrees(self._joint1_target):.2f} deg",
+            flush=True,
+        )
+
+    def _step_joint1_rotation(self) -> bool:
+        if self._joint1_target is None:
+            raise RuntimeError(
+                "joint1 target is not set"
+            )
+
+        current = np.asarray(
+            self.robot.get_joint_positions(),
+            dtype=np.float64,
+        )
+
+        if current.size == 0:
+            raise RuntimeError(
+                "robot has no joint positions"
+            )
+
+        error = float(
+            self._joint1_target - current[0]
+        )
+
+        if abs(error) <= self.joint1_turn_tolerance_rad:
+            print(
+                f"[JOINT1 {self.robot_id}] 완료: "
+                f"{np.degrees(current[0]):.2f} deg",
+                flush=True,
+            )
+            return True
+
+        # 최종 목표를 한 번에 전달하지 않고, 현재 각도에서
+        # 최대 joint1_turn_max_step_rad만큼만 다음 목표를 보낸다.
+        step = float(
+            np.clip(
+                error,
+                -self.joint1_turn_max_step_rad,
+                self.joint1_turn_max_step_rad,
+            )
+        )
+        next_target = float(current[0] + step)
+
+        self.robot.apply_action(
+            ArticulationAction(
+                joint_positions=np.array(
+                    [next_target],
+                    dtype=np.float64,
+                ),
+                joint_indices=np.array(
+                    [0],
+                    dtype=np.int64,
+                ),
+            )
+        )
+
+        return False
+
+
+
+    def _capture_safe_tracking_pose(self) -> None:
+        joints = np.asarray(
+            self.robot.get_joint_positions(),
+            dtype=np.float64,
+        ).copy()
+
+        if joints.ndim != 1 or joints.size == 0:
+            raise RuntimeError(
+                "invalid safe tracking joint positions"
+            )
+
+        self._safe_tracking_joint_positions = joints
+
+        print(
+            f"[SAFE {self.robot_id}] "
+            "joint1 회전 완료 관절 자세 저장: "
+            f"{np.degrees(joints).round(2)} deg",
+            flush=True,
+        )
+
+    def _step_safe_joint_return(self) -> bool:
+        if self._safe_tracking_joint_positions is None:
+            raise RuntimeError(
+                "safe tracking joint positions are not captured"
+            )
+
+        current = np.asarray(
+            self.robot.get_joint_positions(),
+            dtype=np.float64,
+        )
+
+        target = self._safe_tracking_joint_positions
+
+        if current.shape != target.shape:
+            raise RuntimeError(
+                "safe joint shape mismatch: "
+                f"current={current.shape}, target={target.shape}"
+            )
+
+        error = target - current
+        max_error = float(np.max(np.abs(error)))
+
+        if max_error <= self.safe_joint_return_tolerance_rad:
+            print(
+                f"[SAFE {self.robot_id}] "
+                "회전 완료 관절 자세 복귀 완료",
+                flush=True,
+            )
+            return True
+
+        step = np.clip(
+            error,
+            -self.safe_joint_return_max_step_rad,
+            self.safe_joint_return_max_step_rad,
+        )
+
+        next_target = current + step
+
+        self.robot.apply_action(
+            ArticulationAction(
+                joint_positions=next_target,
+            )
+        )
+
+        return False
+
 
     def _calculate_place_targets(self):
         if self._place_reference_position is None:
@@ -294,16 +508,12 @@ class M0609StateMachine:
         return high, down, lift
 
     def _on_enter_idle(self) -> None:
+        # IDLE은 이동 상태가 아니다.
+        # 최초 관절 자세 도착 후 명령을 기다리는 상태다.
         self.robot.gripper.open()
-        self._idle_at_staging = False
-
-        self._set_move_target(
-            self.idle_position,
-            self.idle_orientation,
-        )
 
         print(
-            "[IDLE] 대기 위치 이동/대기",
+            f"[IDLE {self.robot_id}] 명령 대기",
             flush=True,
         )
 
@@ -317,19 +527,11 @@ class M0609StateMachine:
             self._pending_pick_index
         )
 
-        self._active_tray_id = (
-            self._pending_pick_index
-        )
+        self._active_tray_id = self._pending_pick_index
 
-        # 피킹 순간 실제 pose
-        self._pick_position = (
-            snapshot.pick_position.copy()
-        )
-        self._pick_orientation = (
-            snapshot.pick_orientation.copy()
-        )
+        self._pick_position = snapshot.pick_position.copy()
+        self._pick_orientation = snapshot.pick_orientation.copy()
 
-        # 생성 당시 원복 pose
         self._place_reference_position = (
             snapshot.spawn_reference_position.copy()
         )
@@ -356,52 +558,89 @@ class M0609StateMachine:
         self.tracking_controller.reset()
         self._tracking_error_reported = False
 
-        # 이전 사이클의 HOME 값이 남아 다음 사이클에 영향을
-        # 주지 않도록 TRACKING 진입 시 캐시를 명시적으로 초기화한다.
         self._last_hand_mode_sequence = (
             self.hand_input.reset_mode("TRACKING")
         )
 
         print(
             "[TRACKING] 손 추종 시작 "
-            "(hand mode reset)",
+            "(PLACE 명령 대기)",
+            flush=True,
+        )
+
+    def _is_side_route(self) -> bool:
+        """
+        joint1 회전량이 있는 TRANSIT_1/3만 좌우 우회 경로로 본다.
+        TRANSIT_2는 중앙 경로다.
+        """
+        task = self._require_task()
+        return abs(task.joint1_delta_rad) > 1e-9
+
+    def _enter_center_place(self) -> None:
+        """
+        중앙 경로 전용 PLACE 진입.
+
+        기존 동작을 유지한다.
+        TRACKING 위치에서 중앙 경유지로 이동한 뒤 트레이로 복귀한다.
+        joint1 회전 및 안전 관절 자세 복귀는 사용하지 않는다.
+        """
+        self._place_phase = PlacePhase.MOVE_TRANSIT
+        self._set_transit_target()
+
+        print(
+            f"[PLACE {self.robot_id}] "
+            "중앙 경로 복귀: TRANSIT_2 -> 트레이",
+            flush=True,
+        )
+
+    def _enter_side_place(self) -> None:
+        """
+        좌우 우회 경로 전용 PLACE 진입.
+
+        회전 완료 당시 관절 자세로 복귀한 뒤,
+        joint1을 원복하고 TRANSIT_1/3을 거쳐 트레이로 돌아간다.
+        """
+        if self._joint1_before_tracking is None:
+            raise RuntimeError(
+                "side route joint1 return angle is missing"
+            )
+
+        if self._safe_tracking_joint_positions is None:
+            raise RuntimeError(
+                "side route safe joint pose is missing"
+            )
+
+        self._place_phase = PlacePhase.MOVE_SAFE_RETURN
+
+        print(
+            f"[PLACE {self.robot_id}] "
+            "좌우 경로 복귀: 안전 관절 자세 -> "
+            "joint1 원복 -> 경유지 -> 트레이",
             flush=True,
         )
 
     def _on_enter_place(self) -> None:
-        self._place_phase = PlacePhase.MOVE_STAGING
         self._release_wait_frames = 0
         self._release_stable_frames = 0
         self._release_timeout_reported = False
 
-        self._set_move_target(
-            self._get_transport_position(),
-            self._require_task().transit_orientation,
-        )
+        if self._is_side_route():
+            self._enter_side_place()
+        else:
+            self._enter_center_place()
 
+    def _on_enter_return_home(self) -> None:
+        # PLACE의 수직 상승이 끝난 뒤 경유지로 다시 가지 않고,
+        # 최초 실행 관절 자세로 바로 복귀한다.
         print(
-            "[PLACE] 임시구역으로 복귀",
+            f"[RETURN_HOME {self.robot_id}] "
+            "최초 관절 자세로 복귀",
             flush=True,
         )
 
     def _step_idle(self) -> None:
-        if not self._idle_at_staging:
-            self.robot.apply_action(
-                self.move_controller.forward()
-            )
-
-            if self.move_controller.is_done():
-                self._idle_at_staging = True
-                print(
-                    "[IDLE] 명령 대기",
-                    flush=True,
-                )
-            return
-
         if self._pending_pick_index is not None:
-            self._change_state(
-                M0609State.PICK
-            )
+            self._change_state(M0609State.PICK)
 
     def _step_pick(self) -> None:
         if (
@@ -418,9 +657,7 @@ class M0609StateMachine:
                 .get_current_event()
             )
 
-            ee_offset = (
-                self.pick_default_ee_offset.copy()
-            )
+            ee_offset = self.pick_default_ee_offset.copy()
 
             if event in (1, 2, 3):
                 ee_offset[2] -= (
@@ -438,53 +675,74 @@ class M0609StateMachine:
                     self._pick_orientation
                 ),
             )
-
             self.robot.apply_action(actions)
 
             if event >= 4:
-                self._set_move_target(
-                    self._get_transport_position(),
-                    self._require_task().transit_orientation,
-                )
-                self._pick_phase = (
-                    PickPhase.MOVE_STAGING
-                )
+                self._set_transit_target()
+                self._pick_phase = PickPhase.MOVE_TRANSIT
 
                 print(
-                    "[PICK] 흡착 완료, 임시구역 이동",
+                    f"[PICK {self.robot_id}] "
+                    "흡착 완료, 경유지 이동",
                     flush=True,
                 )
 
-        elif (
-            self._pick_phase
-            == PickPhase.MOVE_STAGING
-        ):
+        elif self._pick_phase == PickPhase.MOVE_TRANSIT:
             self.robot.apply_action(
                 self.move_controller.forward()
             )
 
             if self.move_controller.is_done():
+                current = np.asarray(
+                    self.robot.get_joint_positions(),
+                    dtype=np.float64,
+                )
+                self._joint1_before_tracking = float(
+                    current[0]
+                )
+
+                delta = (
+                    self._require_task().joint1_delta_rad
+                )
+
+                if abs(delta) <= 1e-9:
+                    # 중앙 경로는 기존 동작을 유지한다.
+                    # joint1 회전이나 안전 관절 자세 저장을 사용하지 않는다.
+                    self._change_state(
+                        M0609State.TRACKING
+                    )
+                    return
+
+                self._start_joint1_rotation(
+                    self._joint1_before_tracking
+                    + delta
+                )
+                self._pick_phase = (
+                    PickPhase.ROTATE_JOINT1_OUT
+                )
+
+        elif self._pick_phase == PickPhase.ROTATE_JOINT1_OUT:
+            if self._step_joint1_rotation():
+                # 90도 회전이 끝난 실제 TCP pose 자체를
+                # 안전 위치로 저장하고 바로 TRACKING을 시작한다.
+                self._capture_safe_tracking_pose()
                 self._change_state(
                     M0609State.TRACKING
                 )
 
     def _step_tracking(self) -> None:
-        hand_mode, sequence = (
-            self.hand_input.get_mode()
-        )
+        hand_mode, sequence = self.hand_input.get_mode()
 
         if sequence != self._last_hand_mode_sequence:
             self._last_hand_mode_sequence = sequence
 
-            if str(hand_mode).strip().upper() == "HOME":
+            if str(hand_mode).strip().upper() == "PLACE":
                 self._change_state(
                     M0609State.PLACE
                 )
                 return
 
-        hand_target, _ = (
-            self.hand_input.get_target()
-        )
+        hand_target, _ = self.hand_input.get_target()
 
         if hand_target is None:
             return
@@ -509,11 +767,32 @@ class M0609StateMachine:
                 "Place orientation is missing"
             )
 
-        high, down, lift = (
-            self._calculate_place_targets()
-        )
+        high, down, lift = self._calculate_place_targets()
 
-        if self._place_phase == PlacePhase.MOVE_STAGING:
+        if self._place_phase == PlacePhase.MOVE_SAFE_RETURN:
+            # 좌우 우회 경로 전용
+            if self._step_safe_joint_return():
+                self._start_joint1_rotation(
+                    self._joint1_before_tracking
+                )
+                self._place_phase = (
+                    PlacePhase.ROTATE_JOINT1_BACK
+                )
+
+        elif (
+            self._place_phase
+            == PlacePhase.ROTATE_JOINT1_BACK
+        ):
+            # 좌우 우회 경로 전용
+            if self._step_joint1_rotation():
+                self._set_transit_target()
+                self._place_phase = (
+                    PlacePhase.MOVE_TRANSIT
+                )
+
+        elif self._place_phase == PlacePhase.MOVE_TRANSIT:
+            # 중앙 경로는 PLACE 진입 직후 여기서 시작한다.
+            # 좌우 경로는 관절 원복 후 여기로 들어온다.
             self.robot.apply_action(
                 self.move_controller.forward()
             )
@@ -523,9 +802,7 @@ class M0609StateMachine:
                     high,
                     self._place_tool_orientation,
                 )
-                self._place_phase = (
-                    PlacePhase.MOVE_HIGH
-                )
+                self._place_phase = PlacePhase.MOVE_HIGH
 
         elif self._place_phase == PlacePhase.MOVE_HIGH:
             self.robot.apply_action(
@@ -537,9 +814,7 @@ class M0609StateMachine:
                     down,
                     self._place_tool_orientation,
                 )
-                self._place_phase = (
-                    PlacePhase.MOVE_DOWN
-                )
+                self._place_phase = PlacePhase.MOVE_DOWN
 
         elif self._place_phase == PlacePhase.MOVE_DOWN:
             self.robot.apply_action(
@@ -547,37 +822,26 @@ class M0609StateMachine:
             )
 
             if self.move_controller.is_done():
-                self._place_phase = (
-                    PlacePhase.RELEASE
-                )
+                self._place_phase = PlacePhase.RELEASE
 
         elif self._place_phase == PlacePhase.RELEASE:
-            # open() 반환값은 명령 호출 성공 여부다.
-            # 실제 attachment 해제는 RELEASE_WAIT에서 별도로 확인한다.
             self.robot.gripper.open()
 
             self._release_wait_frames = 0
             self._release_stable_frames = 0
             self._release_timeout_reported = False
-
-            self._place_phase = (
-                PlacePhase.RELEASE_WAIT
-            )
+            self._place_phase = PlacePhase.RELEASE_WAIT
 
             print(
                 "[PLACE] 듀얼 그리퍼 해제 대기 시작",
                 flush=True,
             )
 
-        elif (
-            self._place_phase
-            == PlacePhase.RELEASE_WAIT
-        ):
+        elif self._place_phase == PlacePhase.RELEASE_WAIT:
             self._release_wait_frames += 1
 
             fully_released = bool(
-                self.robot.gripper
-                .is_fully_released()
+                self.robot.gripper.is_fully_released()
             )
 
             if fully_released:
@@ -585,18 +849,19 @@ class M0609StateMachine:
             else:
                 self._release_stable_frames = 0
 
-            # attachment가 남아 있으면 일정 간격으로 양쪽 open 재호출.
             if (
                 not fully_released
-                and self._release_wait_frames
-                % self.place_release_retry_interval
-                == 0
+                and (
+                    self._release_wait_frames
+                    % self.place_release_retry_interval
+                    == 0
+                )
             ):
                 print(
                     "[PLACE] attachment 잔류, "
                     "open 재시도: "
                     f"frame={self._release_wait_frames}, "
-                    f"states="
+                    "states="
                     f"{self.robot.gripper.get_release_states()}",
                     flush=True,
                 )
@@ -606,16 +871,12 @@ class M0609StateMachine:
                 self._release_wait_frames
                 >= self.place_release_min_wait_frames
             )
-
             released_stably = (
                 self._release_stable_frames
                 >= self.place_release_stable_frames
             )
 
-            if (
-                waited_long_enough
-                and released_stably
-            ):
+            if waited_long_enough and released_stably:
                 print(
                     "[PLACE] 듀얼 그리퍼 완전 해제 확인: "
                     f"wait={self._release_wait_frames}, "
@@ -627,17 +888,13 @@ class M0609StateMachine:
                     lift,
                     self._place_tool_orientation,
                 )
-                self._place_phase = (
-                    PlacePhase.LIFT
-                )
+                self._place_phase = PlacePhase.LIFT
 
             elif (
                 self._release_wait_frames
                 >= self.place_release_timeout_frames
                 and not fully_released
             ):
-                # 해제가 확인되지 않은 상태에서 상승하면 도구를 끌 수 있다.
-                # 따라서 상승하지 않고 그 자리에서 계속 open을 재시도한다.
                 if not self._release_timeout_reported:
                     print(
                         "[PLACE] 그리퍼 해제 타임아웃. "
@@ -653,37 +910,71 @@ class M0609StateMachine:
             )
 
             if self.move_controller.is_done():
-                self._set_move_target(
-                    self._get_transport_position(),
-                    self._require_task().transit_orientation,
-                )
-                self._place_phase = (
-                    PlacePhase.RETURN_STAGING
-                )
-
-        elif (
-            self._place_phase
-            == PlacePhase.RETURN_STAGING
-        ):
-            self.robot.apply_action(
-                self.move_controller.forward()
-            )
-
-            if self.move_controller.is_done():
+                # 트레이 위 수직 상승이 끝나면 작업 데이터는 정리한다.
+                # 경유지로 다시 이동하지 않고 RETURN_HOME으로 전환한다.
                 self._clear_active_tray()
                 self._change_state(
-                    M0609State.IDLE
+                    M0609State.RETURN_HOME
                 )
+
+    def _step_return_home(self) -> None:
+        current_joint_positions = np.asarray(
+            self.robot.get_joint_positions(),
+            dtype=np.float64,
+        )
+
+        if (
+            current_joint_positions.shape
+            != self.idle_joint_positions.shape
+        ):
+            raise RuntimeError(
+                "현재 관절값과 최초 관절값의 크기가 다릅니다: "
+                f"current={current_joint_positions.shape}, "
+                f"home={self.idle_joint_positions.shape}"
+            )
+
+        joint_error = float(
+            np.max(
+                np.abs(
+                    current_joint_positions
+                    - self.idle_joint_positions
+                )
+            )
+        )
+
+        if joint_error <= self.idle_joint_tolerance:
+            print(
+                f"[RETURN_HOME {self.robot_id}] "
+                "최초 관절 자세 도착",
+                flush=True,
+            )
+            self._change_state(
+                M0609State.IDLE
+            )
+            return
+
+        self.robot.apply_action(
+            ArticulationAction(
+                joint_positions=self.idle_joint_positions,
+            )
+        )
 
     def _clear_active_tray(self) -> None:
         self._current_task = None
         self._pending_pick_index = None
         self._active_tray_id = None
+
         self._pick_position = None
         self._pick_orientation = None
+
         self._place_reference_position = None
         self._place_reference_orientation = None
         self._place_tool_orientation = None
+
+        self._joint1_before_tracking = None
+        self._joint1_target = None
+        self._safe_tracking_joint_positions = None
+
         self._release_wait_frames = 0
         self._release_stable_frames = 0
         self._release_timeout_reported = False
@@ -700,6 +991,8 @@ class M0609StateMachine:
                 self._on_enter_tracking()
             elif self._state == M0609State.PLACE:
                 self._on_enter_place()
+            elif self._state == M0609State.RETURN_HOME:
+                self._on_enter_return_home()
 
         if self._state == M0609State.IDLE:
             self._step_idle()
@@ -709,13 +1002,23 @@ class M0609StateMachine:
             self._step_tracking()
         elif self._state == M0609State.PLACE:
             self._step_place()
+        elif self._state == M0609State.RETURN_HOME:
+            self._step_return_home()
 
     def reset(self) -> None:
+        # Play 재시작 시 initialize_robot()이 최초 자세를 다시 적용하므로
+        # 상태 머신은 실제 대기 상태인 IDLE에서 시작한다.
         self._state = M0609State.IDLE
         self._state_entered = True
+
         self._pick_phase = PickPhase.PICKING
-        self._place_phase = PlacePhase.MOVE_STAGING
-        self._idle_at_staging = False
+        self._place_phase = PlacePhase.MOVE_TRANSIT
+
+        # 좌우 우회 경로 전용 상태도 Play 재시작 시 초기화한다.
+        self._joint1_before_tracking = None
+        self._joint1_target = None
+        self._safe_tracking_joint_positions = None
+
         self._last_hand_mode_sequence = -1
         self._tracking_error_reported = False
 

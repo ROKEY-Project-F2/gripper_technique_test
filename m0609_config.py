@@ -7,7 +7,7 @@ _THIS_DIR = Path(__file__).resolve().parent
 
 
 # ============================================================
-# 전체 Scene USD / 로봇 Prim 설정
+# 전체 Scene USD
 # ============================================================
 ROBOT_USD_PATH = str(
     _THIS_DIR
@@ -15,29 +15,56 @@ ROBOT_USD_PATH = str(
     / "full_scene.usda"
 )
 
-ROBOT_PRIM_PATH = "/World/m0609"
-ROBOT_SCENE_NAME = "m0609_robot"
+
+# ============================================================
+# Robot A / Robot B Prim 및 Scene 이름
+# ============================================================
+ROBOT_A_PRIM_PATH = "/World/m0609_01"
+ROBOT_A_SCENE_NAME = "m0609_robot_a"
+
+ROBOT_B_PRIM_PATH = "/World/m0609"
+ROBOT_B_SCENE_NAME = "m0609_robot_b"
+
 EE_LINK_NAME = "link_6"
 
 
 # ============================================================
 # Surface Gripper 설정
 # ============================================================
-_SURFACE_GRIPPER_BASE_PATH = (
-    f"{ROBOT_PRIM_PATH}"
-    "/onrobot_rg2ft/gripper_body/dual_suction_tool"
+def _surface_gripper_paths(
+    robot_prim_path: str,
+):
+    base_path = (
+        f"{robot_prim_path}"
+        "/onrobot_rg2ft/gripper_body/"
+        "dual_suction_tool"
+    )
+
+    return [
+        (
+            f"{base_path}"
+            "/suction_contact_left/"
+            "SurfaceGripper_left"
+        ),
+        (
+            f"{base_path}"
+            "/suction_contact_right/"
+            "SurfaceGripper_right"
+        ),
+    ]
+
+
+ROBOT_A_SURFACE_GRIPPER_PATHS = (
+    _surface_gripper_paths(
+        ROBOT_A_PRIM_PATH
+    )
 )
 
-SURFACE_GRIPPER_PATHS = [
-    (
-        f"{_SURFACE_GRIPPER_BASE_PATH}"
-        "/suction_contact_left/SurfaceGripper_left"
-    ),
-    (
-        f"{_SURFACE_GRIPPER_BASE_PATH}"
-        "/suction_contact_right/SurfaceGripper_right"
-    ),
-]
+ROBOT_B_SURFACE_GRIPPER_PATHS = (
+    _surface_gripper_paths(
+        ROBOT_B_PRIM_PATH
+    )
+)
 
 SURFACE_GRIPPER_WRITE_STATUS_TO_USD = True
 
@@ -51,7 +78,7 @@ DRIVE_MAX_FORCE = 1e8
 
 
 # ============================================================
-# RMPFlow 설정
+# RMPflow 설정
 # ============================================================
 RMPFLOW_DIR = str(
     _THIS_DIR / "rmpflow"
@@ -79,18 +106,13 @@ M0609_RMPFLOW_CONFIG_PATH = str(
 
 # ============================================================
 # cuRobo 손 추종 설정
+#
+# 실제 Robot A/B base pose는 main.py에서 각 Prim의
+# world pose를 읽어 자동으로 계산한다.
 # ============================================================
 CUROBO_ROBOT_CONFIG_PATH = str(
     _THIS_DIR / "m0609_v1.yml"
 )
-
-ROBOT_BASE_POSITION = (
-    0.5,
-    0.2,
-    1.0,
-)
-
-ROBOT_BASE_YAW_DEG = 90.0
 
 TRACKING_TOOL_ORIENTATION = (
     0.0,
@@ -123,14 +145,38 @@ TOOL_DIR = (
 )
 
 TOOL_USDS = (
-    str(TOOL_DIR / "sm_bipolardissectingscissors_a01_01.usd"),
-    str(TOOL_DIR / "sm_caliper_a01_01.usd"),
-    str(TOOL_DIR / "sm_clamps_a01_01.usd"),
-    str(TOOL_DIR / "sm_forceps_a01_01.usd"),
-    str(TOOL_DIR / "sm_handsaws_a01_01.usd"),
-    str(TOOL_DIR / "sm_knife_a01_01.usd"),
-    str(TOOL_DIR / "sm_ligatureneedle_a01_01.usd"),
-    str(TOOL_DIR / "sm_mallet_a01_01.usd"),
+    str(
+        TOOL_DIR
+        / "sm_bipolardissectingscissors_a01_01.usd"
+    ),
+    str(
+        TOOL_DIR
+        / "sm_caliper_a01_01.usd"
+    ),
+    str(
+        TOOL_DIR
+        / "sm_clamps_a01_01.usd"
+    ),
+    str(
+        TOOL_DIR
+        / "sm_forceps_a01_01.usd"
+    ),
+    str(
+        TOOL_DIR
+        / "sm_handsaws_a01_01.usd"
+    ),
+    str(
+        TOOL_DIR
+        / "sm_knife_a01_01.usd"
+    ),
+    str(
+        TOOL_DIR
+        / "sm_ligatureneedle_a01_01.usd"
+    ),
+    str(
+        TOOL_DIR
+        / "sm_mallet_a01_01.usd"
+    ),
 )
 
 TOOL_NAMES = (
@@ -147,25 +193,20 @@ TOOL_NAMES = (
 TOOL_DROP_HEIGHT = 0.05
 TOOL_MASS = 0.001
 
-# 수술 도구 USD는 원본 에셋 단위가 커서 meter stage에 맞게 축소한다.
-# 도구별로 독립 조절할 수 있도록 분리했다.
-# 현재는 8종 모두 1/100 스케일을 사용한다.
 TOOL_SCALES = (
-    (0.0060, 0.0060, 0.0060),  # 0 바이폴라: 추가 축소
-    (0.0060, 0.0060, 0.0060),  # 1 캘리퍼: 추가 축소
-    (0.0075, 0.0075, 0.0075),  # 2 클램프
-    (0.0075, 0.0075, 0.0075),  # 3 겸자
-    (0.0035, 0.0035, 0.0035),  # 4 톱
-    (0.0040, 0.0040, 0.0040),  # 5 메스
-    (0.0075, 0.0075, 0.0075),  # 6 갈고리
-    (0.0045, 0.0045, 0.0045),  # 7 망치: 확대
+    (0.0060, 0.0060, 0.0060),
+    (0.0060, 0.0060, 0.0060),
+    (0.0075, 0.0075, 0.0075),
+    (0.0075, 0.0075, 0.0075),
+    (0.0035, 0.0035, 0.0035),
+    (0.0040, 0.0040, 0.0040),
+    (0.0075, 0.0075, 0.0075),
+    (0.0045, 0.0045, 0.0045),
 )
 
 TRAY_TOP_Z = 0.0186
 TRAY_Z = 1.05
 
-# 공간 배치를 위해 팀원 코드의 90도 초기 회전을 그대로 사용한다.
-# 모든 트레이에 동일하게 적용하며 랜덤 회전은 사용하지 않는다.
 TRAY_ORIENTATION = (
     0.7071,
     0.0,
@@ -173,35 +214,81 @@ TRAY_ORIENTATION = (
     0.7071,
 )
 
-# 팀원 코드의 트레이 8개 배치 순서:
-# x 하나마다 y=0.55, 0.85 순서
 TRAY_SPAWN_POSITIONS = {
-    0: (-0.72, 0.55, TRAY_Z),
-    1: (-0.72, 0.85, TRAY_Z),
-    2: (-0.24, 0.55, TRAY_Z),
-    3: (-0.24, 0.85, TRAY_Z),
-    4: (0.24, 0.55, TRAY_Z),
-    5: (0.24, 0.85, TRAY_Z),
-    6: (0.72, 0.55, TRAY_Z),
-    7: (0.72, 0.85, TRAY_Z),
+    # 전체 배열 폭을 줄여 트레이를 중앙 쪽으로 배치한다.
+    # x 간격은 0.40 m로 일정하게 유지한다.
+    #
+    #   1    3    5    7
+    #   0    2    4    6
+    #
+    0: (-0.60, 0.55, TRAY_Z),
+    1: (-0.60, 0.85, TRAY_Z),
+    2: (-0.20, 0.55, TRAY_Z),
+    3: (-0.20, 0.85, TRAY_Z),
+    4: (0.20, 0.55, TRAY_Z),
+    5: (0.20, 0.85, TRAY_Z),
+    6: (0.60, 0.55, TRAY_Z),
+    7: (0.60, 0.85, TRAY_Z),
 }
 
-# 현재 프로젝트는 우측의 단일 로봇을 사용하므로
-# 실제 작업 명령은 기존과 동일하게 4~7만 허용한다.
-SUPPORTED_TRAY_COMMANDS = (
+ROBOT_A_SUPPORTED_TRAY_COMMANDS = (
+    0,
+    1,
+    2,
+    3,
+)
+
+ROBOT_B_SUPPORTED_TRAY_COMMANDS = (
     4,
     5,
     6,
     7,
 )
 
-# 트래킹 구역과 트레이 구역 사이의 임시 대기 위치
-STAGING_POSITION = (
-    0.10,
-    0.50,
-    1.35,
-)
 
+# ============================================================
+# 경유지 설정
+#
+# 경유지 2의 x, y는 main.py에서 Robot A와 Robot B 베이스의
+# 정확한 중점으로 계산한다.
+#
+#   TRANSIT_2.xy = (Robot A base.xy + Robot B base.xy) / 2
+#
+# 경유지 1과 3은 각 로봇 베이스를 중심으로 경유지 2를
+# 반대편에 같은 거리만큼 반사해 계산한다.
+#
+#   TRANSIT_1.xy = 2 * Robot A base.xy - TRANSIT_2.xy
+#   TRANSIT_3.xy = 2 * Robot B base.xy - TRANSIT_2.xy
+#
+# 세 경유지의 높이는 동일하게 유지한다.
+# ============================================================
+TRANSIT_HEIGHT = 1.35
+
+# 경유지 도착 후 TRACKING 시작 전 첫 번째 관절 회전량.
+# Robot A/B 설치 방향이 반대이면 부호를 서로 바꾼다.
+ROBOT_A_TRACKING_JOINT1_DELTA_DEG = 90.0
+ROBOT_B_TRACKING_JOINT1_DELTA_DEG = -90.0
+
+# joint1 회전 완료 판정 허용 오차.
+JOINT1_TURN_TOLERANCE_DEG = 1.0
+
+# joint1 회전 시 한 simulation step에서 허용할 최대 회전량.
+# main loop가 약 100 Hz라면 0.25 deg/step은 약 25 deg/s이다.
+JOINT1_TURN_MAX_STEP_DEG = 0.50
+
+# PLACE 시 회전 완료 당시의 전체 관절 자세로 복귀할 때
+# 한 simulation step에서 각 관절이 움직일 수 있는 최대 각도.
+SAFE_JOINT_RETURN_MAX_STEP_DEG = 0.35
+
+# 안전 관절 자세 도착 판정 허용 오차.
+SAFE_JOINT_RETURN_TOLERANCE_DEG = 1.0
+
+
+
+
+# ============================================================
+# PICK / PLACE 설정
+# ============================================================
 PICK_EVENTS_DT = (
     0.008,
     0.005,
@@ -222,26 +309,13 @@ PICK_DEFAULT_EE_OFFSET = (
 )
 
 PICK_APPROACH_Z_CORRECTION = 0.032
-
-# PICK 완료 후 경유 위치로 이동하거나 PLACE를 위해 복귀할 때
-# 기본 경유 위치보다 추가로 올릴 높이.
 TRANSPORT_Z_OFFSET = 0.10
 
 PLACE_LINK6_ABOVE_TRAY = 0.136
-
-# PLACE 직전 트레이 상부 접근 높이.
 PLACE_HIGH_OFFSET = 0.15
-
-# 실제 그리퍼를 열 때 트레이 표면 위 여유 높이.
-# 기존 5 cm에서 1.5 cm로 낮춰 도구를 떨어뜨리는 느낌을 줄인다.
 PLACE_APPROACH_GAP = 0.015
-
 PLACE_MOVE_TOLERANCE = 0.04
 
-# Surface Gripper 해제 안정화 설정
-#
-# physics step 기준 값이다. 시뮬레이션이 60 Hz라면:
-# 30 frame ≈ 0.5초, 120 frame ≈ 2초.
 PLACE_RELEASE_MIN_WAIT_FRAMES = 30
 PLACE_RELEASE_STABLE_FRAMES = 10
 PLACE_RELEASE_RETRY_INTERVAL = 15
@@ -258,9 +332,18 @@ INITIAL_SETTLING_FRAMES = 30
 # 설정 파일 검증
 # ============================================================
 _REQUIRED_FILES = [
-    ("ROBOT_USD_PATH", ROBOT_USD_PATH),
-    ("M0609_URDF_PATH", M0609_URDF_PATH),
-    ("M0609_DESCRIPTION_PATH", M0609_DESCRIPTION_PATH),
+    (
+        "ROBOT_USD_PATH",
+        ROBOT_USD_PATH,
+    ),
+    (
+        "M0609_URDF_PATH",
+        M0609_URDF_PATH,
+    ),
+    (
+        "M0609_DESCRIPTION_PATH",
+        M0609_DESCRIPTION_PATH,
+    ),
     (
         "M0609_RMPFLOW_CONFIG_PATH",
         M0609_RMPFLOW_CONFIG_PATH,
@@ -269,7 +352,10 @@ _REQUIRED_FILES = [
         "CUROBO_ROBOT_CONFIG_PATH",
         CUROBO_ROBOT_CONFIG_PATH,
     ),
-    ("TRAY_USD_PATH", TRAY_USD_PATH),
+    (
+        "TRAY_USD_PATH",
+        TRAY_USD_PATH,
+    ),
 ]
 
 for setting_name, setting_path in _REQUIRED_FILES:
@@ -279,9 +365,12 @@ for setting_name, setting_path in _REQUIRED_FILES:
             f"{setting_path}"
         )
 
-for tool_index, tool_path in enumerate(TOOL_USDS):
+for tool_index, tool_path in enumerate(
+    TOOL_USDS
+):
     if not Path(tool_path).is_file():
         raise FileNotFoundError(
-            f"TOOL_USDS[{tool_index}] 파일을 찾을 수 없습니다: "
+            f"TOOL_USDS[{tool_index}] "
+            "파일을 찾을 수 없습니다: "
             f"{tool_path}"
         )

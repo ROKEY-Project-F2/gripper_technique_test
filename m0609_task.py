@@ -2,23 +2,60 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Sequence
+
 import omni.usd
 from pxr import Usd, UsdPhysics
 
 from isaacsim.core.api.tasks import BaseTask
-from isaacsim.robot.manipulators.manipulators import SingleManipulator
+from isaacsim.robot.manipulators.manipulators import (
+    SingleManipulator,
+)
 
-from dual_surface_gripper_adapter import DualSurfaceGripperAdapter
-
+from dual_surface_gripper_adapter import (
+    DualSurfaceGripperAdapter,
+)
 from m0609_config import (
     DRIVE_DAMPING,
     DRIVE_MAX_FORCE,
     DRIVE_STIFFNESS,
     EE_LINK_NAME,
-    ROBOT_PRIM_PATH,
-    ROBOT_SCENE_NAME,
-    SURFACE_GRIPPER_PATHS,
+    ROBOT_A_PRIM_PATH,
+    ROBOT_A_SCENE_NAME,
+    ROBOT_A_SURFACE_GRIPPER_PATHS,
+    ROBOT_B_PRIM_PATH,
+    ROBOT_B_SCENE_NAME,
+    ROBOT_B_SURFACE_GRIPPER_PATHS,
     SURFACE_GRIPPER_WRITE_STATUS_TO_USD,
+)
+
+
+@dataclass(frozen=True)
+class RobotRegistration:
+    robot_id: str
+    prim_path: str
+    scene_name: str
+    surface_gripper_paths: Sequence[str]
+
+
+ROBOT_REGISTRATIONS = (
+    RobotRegistration(
+        robot_id="A",
+        prim_path=ROBOT_A_PRIM_PATH,
+        scene_name=ROBOT_A_SCENE_NAME,
+        surface_gripper_paths=(
+            ROBOT_A_SURFACE_GRIPPER_PATHS
+        ),
+    ),
+    RobotRegistration(
+        robot_id="B",
+        prim_path=ROBOT_B_PRIM_PATH,
+        scene_name=ROBOT_B_SCENE_NAME,
+        surface_gripper_paths=(
+            ROBOT_B_SURFACE_GRIPPER_PATHS
+        ),
+    ),
 )
 
 
@@ -27,8 +64,11 @@ def find_prim_path_by_name(
     name: str,
 ):
     """root_path 아래에서 이름이 일치하는 Prim 경로를 찾는다."""
+
     stage = omni.usd.get_context().get_stage()
-    root_prim = stage.GetPrimAtPath(root_path)
+    root_prim = stage.GetPrimAtPath(
+        root_path
+    )
 
     if not root_prim.IsValid():
         return None
@@ -40,29 +80,47 @@ def find_prim_path_by_name(
     return None
 
 
-def initialize_robot(robot, world) -> None:
+def initialize_robot(
+    robot,
+    world,
+) -> None:
     """SingleManipulator와 Surface Gripper를 초기화한다."""
-    print("[task] robot.initialize 시작")
-    robot.initialize()
-    print("[task] robot.initialize 완료")
 
-    print("[task] gripper.initialize 시작")
+    print(
+        f"[task] {robot.name}.initialize 시작"
+    )
+    robot.initialize()
+    print(
+        f"[task] {robot.name}.initialize 완료"
+    )
+
+    print(
+        f"[task] {robot.name}.gripper.initialize 시작"
+    )
     robot.gripper.initialize(
         physics_sim_view=world.physics_sim_view,
-        articulation_apply_action_func=robot.apply_action,
-        get_joint_positions_func=robot.get_joint_positions,
-        set_joint_positions_func=robot.set_joint_positions,
+        articulation_apply_action_func=(
+            robot.apply_action
+        ),
+        get_joint_positions_func=(
+            robot.get_joint_positions
+        ),
+        set_joint_positions_func=(
+            robot.set_joint_positions
+        ),
         dof_names=robot.dof_names,
     )
-    print("[task] gripper.initialize 완료")
+    print(
+        f"[task] {robot.name}.gripper.initialize 완료"
+    )
 
     robot.gripper.open()
 
 
 class M0609BasicTask(BaseTask):
     """
-    이미 열린 full_scene.usda 안의 M0609을 검색하고
-    Isaac Sim Scene 객체로 등록한다.
+    이미 열린 full_scene.usda 안의 Robot A와 Robot B를
+    검색하고 Isaac Sim Scene 객체로 등록한다.
 
     이 Task에서는 full_scene.usda를 다시 Reference하지 않는다.
     """
@@ -76,80 +134,82 @@ class M0609BasicTask(BaseTask):
             offset=None,
         )
 
-        self._robot = None
-        self._ee_path = None
+        self._robots = {}
 
     def set_up_scene(self, scene) -> None:
         super().set_up_scene(scene)
 
-        self._validate_robot_prim()
-        self._discover_links()
-        self._setup_physics()
-        self._register_robot(scene)
+        stage = omni.usd.get_context().get_stage()
+
+        for registration in ROBOT_REGISTRATIONS:
+            self._register_one_robot(
+                scene=scene,
+                stage=stage,
+                registration=registration,
+            )
 
         print(
-            "\n[완료] 기존 full_scene의 M0609 등록 완료\n",
+            "\n[완료] full_scene의 Robot A/B 등록 완료\n",
             flush=True,
         )
 
-    def _validate_robot_prim(self) -> None:
-        stage = omni.usd.get_context().get_stage()
+    def _register_one_robot(
+        self,
+        *,
+        scene,
+        stage,
+        registration: RobotRegistration,
+    ) -> None:
         robot_root = stage.GetPrimAtPath(
-            ROBOT_PRIM_PATH
+            registration.prim_path
         )
 
         if not robot_root.IsValid():
             top_level_paths = []
 
-            world_prim = stage.GetPrimAtPath("/World")
+            world_prim = stage.GetPrimAtPath(
+                "/World"
+            )
+
             if world_prim.IsValid():
                 top_level_paths = [
                     str(child.GetPath())
-                    for child in world_prim.GetChildren()
+                    for child
+                    in world_prim.GetChildren()
                 ]
 
             raise RuntimeError(
-                "full_scene.usda에서 로봇 Prim을 찾지 못했습니다.\n"
-                f"기대 경로: {ROBOT_PRIM_PATH}\n"
+                "full_scene.usda에서 로봇 Prim을 "
+                "찾지 못했습니다.\n"
+                f"Robot: {registration.robot_id}\n"
+                f"기대 경로: {registration.prim_path}\n"
                 f"/World 하위 Prim: {top_level_paths}"
             )
 
-    def _discover_links(self) -> None:
-        self._ee_path = find_prim_path_by_name(
-            ROBOT_PRIM_PATH,
+        ee_path = find_prim_path_by_name(
+            registration.prim_path,
             EE_LINK_NAME,
         )
 
-        if self._ee_path is None:
+        if ee_path is None:
             raise RuntimeError(
-                f"{ROBOT_PRIM_PATH} 아래에서 "
+                f"{registration.prim_path} 아래에서 "
                 f"'{EE_LINK_NAME}'을 찾지 못했습니다."
             )
 
-        stage = omni.usd.get_context().get_stage()
-
         missing_grippers = [
             path
-            for path in SURFACE_GRIPPER_PATHS
+            for path
+            in registration.surface_gripper_paths
             if not stage.GetPrimAtPath(path).IsValid()
         ]
 
         if missing_grippers:
             raise RuntimeError(
+                f"Robot {registration.robot_id} "
                 "SurfaceGripper Prim을 찾지 못했습니다:\n- "
                 + "\n- ".join(missing_grippers)
             )
-
-        print(
-            f"[task] End Effector 발견: {self._ee_path}",
-            flush=True,
-        )
-
-    def _setup_physics(self) -> None:
-        stage = omni.usd.get_context().get_stage()
-        robot_root = stage.GetPrimAtPath(
-            ROBOT_PRIM_PATH
-        )
 
         drive_count = 0
 
@@ -175,39 +235,40 @@ class M0609BasicTask(BaseTask):
                 drive.GetMaxForceAttr().Set(
                     DRIVE_MAX_FORCE
                 )
-
                 drive_count += 1
 
-        print(
-            f"[task] Drive 설정 완료: {drive_count}개",
-            flush=True,
-        )
-
-    def _register_robot(self, scene) -> None:
         gripper = DualSurfaceGripperAdapter(
-            end_effector_prim_path=self._ee_path,
-            surface_gripper_prim_paths=SURFACE_GRIPPER_PATHS,
+            end_effector_prim_path=ee_path,
+            surface_gripper_prim_paths=(
+                registration.surface_gripper_paths
+            ),
             write_status_to_usd=(
                 SURFACE_GRIPPER_WRITE_STATUS_TO_USD
             ),
         )
 
-        self._robot = scene.add(
+        robot = scene.add(
             SingleManipulator(
-                prim_path=ROBOT_PRIM_PATH,
-                name=ROBOT_SCENE_NAME,
-                end_effector_prim_path=self._ee_path,
+                prim_path=registration.prim_path,
+                name=registration.scene_name,
+                end_effector_prim_path=ee_path,
                 gripper=gripper,
             )
         )
 
+        self._robots[
+            registration.robot_id
+        ] = robot
+
         print(
-            "[task] 로봇 Scene 등록 완료:"
-            f" name={ROBOT_SCENE_NAME},"
-            f" prim={ROBOT_PRIM_PATH}",
+            f"[task] Robot {registration.robot_id} 등록 완료: "
+            f"name={registration.scene_name}, "
+            f"prim={registration.prim_path}, "
+            f"ee={ee_path}, "
+            f"drives={drive_count}",
             flush=True,
         )
 
     def post_reset(self) -> None:
-        if self._robot is not None:
-            self._robot.gripper.post_reset()
+        for robot in self._robots.values():
+            robot.gripper.post_reset()
