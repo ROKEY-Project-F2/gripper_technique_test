@@ -77,6 +77,7 @@ class M0609StateMachine:
         return_home_max_step_rad: float = np.deg2rad(0.20),
         return_home_wrist_max_step_rad: float = np.deg2rad(0.60),
         idle_joint_tolerance: float = np.deg2rad(1.0),
+        post_place_return_speed_multiplier: float = 2.0,
     ) -> None:
         self.robot_id = str(robot_id).strip().upper()
         self.robot = robot
@@ -106,6 +107,9 @@ class M0609StateMachine:
             return_home_wrist_max_step_rad
         )
         self.idle_joint_tolerance = float(idle_joint_tolerance)
+        self.post_place_return_speed_multiplier = float(
+            post_place_return_speed_multiplier
+        )
 
         if self.return_home_max_step_rad <= 0.0:
             raise ValueError(
@@ -120,6 +124,11 @@ class M0609StateMachine:
         if self.idle_joint_tolerance <= 0.0:
             raise ValueError(
                 "idle_joint_tolerance must be > 0"
+            )
+
+        if self.post_place_return_speed_multiplier <= 0.0:
+            raise ValueError(
+                "post_place_return_speed_multiplier must be > 0"
             )
 
         self.tracking_controller = tracking_controller
@@ -256,6 +265,10 @@ class M0609StateMachine:
         self._release_stable_frames = 0
         self._release_timeout_reported = False
 
+        # 그리퍼 완전 해제 확인 이벤트 번호.
+        # RobotManager가 이 값의 변화를 감지해 도구 위치 로그를 출력한다.
+        self._place_release_sequence = 0
+
         print(
             f"[StateMachine {self.robot_id}] 초기 상태: IDLE "
             "(center/side PLACE separated)",
@@ -269,6 +282,10 @@ class M0609StateMachine:
     @property
     def current_task(self) -> Optional[RobotTask]:
         return self._current_task
+
+    @property
+    def place_release_sequence(self) -> int:
+        return self._place_release_sequence
 
     def _change_state(
         self,
@@ -479,7 +496,11 @@ class M0609StateMachine:
             flush=True,
         )
 
-    def _step_joint1_rotation(self) -> bool:
+    def _step_joint1_rotation(
+        self,
+        *,
+        speed_multiplier: float = 1.0,
+    ) -> bool:
         if self._joint1_target is None:
             raise RuntimeError(
                 "joint1 target is not set"
@@ -509,11 +530,16 @@ class M0609StateMachine:
 
         # 최종 목표를 한 번에 전달하지 않고, 현재 각도에서
         # 최대 joint1_turn_max_step_rad만큼만 다음 목표를 보낸다.
+        max_step = (
+            self.joint1_turn_max_step_rad
+            * float(speed_multiplier)
+        )
+
         step = float(
             np.clip(
                 error,
-                -self.joint1_turn_max_step_rad,
-                self.joint1_turn_max_step_rad,
+                -max_step,
+                max_step,
             )
         )
         next_target = float(current[0] + step)
@@ -533,6 +559,87 @@ class M0609StateMachine:
 
         return False
 
+
+
+    def _forward_move_with_speed(
+        self,
+        *,
+        speed_multiplier: float = 1.0,
+    ) -> ArticulationAction:
+        """
+        move_controller가 생성한 다음 관절 목표를 현재 관절값 기준으로
+        확대해 Cartesian 복귀 구간의 진행 속도를 높인다.
+        """
+        action = self.move_controller.forward()
+        multiplier = float(speed_multiplier)
+
+        if multiplier <= 1.0:
+            return action
+
+        target_positions = getattr(
+            action,
+            "joint_positions",
+            None,
+        )
+
+        if target_positions is None:
+            return action
+
+        target_positions = np.asarray(
+            target_positions,
+            dtype=np.float64,
+        )
+
+        joint_indices = getattr(
+            action,
+            "joint_indices",
+            None,
+        )
+
+        current_all = np.asarray(
+            self.robot.get_joint_positions(),
+            dtype=np.float64,
+        )
+
+        if joint_indices is None:
+            if current_all.shape != target_positions.shape:
+                return action
+
+            current = current_all
+        else:
+            joint_indices = np.asarray(
+                joint_indices,
+                dtype=np.int64,
+            )
+
+            if (
+                target_positions.shape
+                != joint_indices.shape
+            ):
+                return action
+
+            current = current_all[joint_indices]
+
+        accelerated_positions = (
+            current
+            + multiplier
+            * (target_positions - current)
+        )
+
+        return ArticulationAction(
+            joint_positions=accelerated_positions,
+            joint_velocities=getattr(
+                action,
+                "joint_velocities",
+                None,
+            ),
+            joint_efforts=getattr(
+                action,
+                "joint_efforts",
+                None,
+            ),
+            joint_indices=joint_indices,
+        )
 
 
     def _capture_safe_tracking_pose(self) -> None:
@@ -1062,10 +1169,14 @@ class M0609StateMachine:
             )
 
             if waited_long_enough and released_stably:
+                self._place_release_sequence += 1
+
                 print(
                     "[PLACE] 듀얼 그리퍼 완전 해제 확인: "
                     f"wait={self._release_wait_frames}, "
-                    f"stable={self._release_stable_frames}",
+                    f"stable={self._release_stable_frames}, "
+                    f"release_sequence="
+                    f"{self._place_release_sequence}",
                     flush=True,
                 )
 
@@ -1091,7 +1202,11 @@ class M0609StateMachine:
 
         elif self._place_phase == PlacePhase.LIFT:
             self.robot.apply_action(
-                self.move_controller.forward()
+                self._forward_move_with_speed(
+                    speed_multiplier=(
+                        self.post_place_return_speed_multiplier
+                    )
+                )
             )
 
             if self.move_controller.is_done():
@@ -1108,7 +1223,11 @@ class M0609StateMachine:
             == PlacePhase.MOVE_POST_PLACE_TRANSIT
         ):
             self.robot.apply_action(
-                self.move_controller.forward()
+                self._forward_move_with_speed(
+                    speed_multiplier=(
+                        self.post_place_return_speed_multiplier
+                    )
+                )
             )
 
             if self.move_controller.is_done():
@@ -1128,7 +1247,11 @@ class M0609StateMachine:
             self._place_phase
             == PlacePhase.ROTATE_PRE_PICK_BACK
         ):
-            if self._step_joint1_rotation():
+            if self._step_joint1_rotation(
+                speed_multiplier=(
+                    self.post_place_return_speed_multiplier
+                )
+            ):
                 print(
                     f"[POST_PLACE {self.robot_id}] "
                     "집기 전 90도 회전 원복 완료",
@@ -1185,13 +1308,17 @@ class M0609StateMachine:
         # 엔드이펙터 방향을 만드는 J4~J6만 더 빠르게 복귀한다.
         max_step = np.full_like(
             error,
-            self.return_home_max_step_rad,
+            (
+                self.return_home_max_step_rad
+                * self.post_place_return_speed_multiplier
+            ),
             dtype=np.float64,
         )
 
         if max_step.size >= 6:
             max_step[3:6] = (
                 self.return_home_wrist_max_step_rad
+                * self.post_place_return_speed_multiplier
             )
 
         step = np.clip(

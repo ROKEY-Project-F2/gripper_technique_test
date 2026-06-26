@@ -52,12 +52,10 @@ from m0609_config import (
     PLACE_RELEASE_STABLE_FRAMES,
     PLACE_RELEASE_TIMEOUT_FRAMES,
     RMPFLOW_DIR,
-    ROBOT_A_IDLE_JOINT_POSITIONS_DEG,
     ROBOT_A_PRIM_PATH,
     ROBOT_A_TRACKING_JOINT1_DELTA_DEG,
     ROBOT_A_SCENE_NAME,
     ROBOT_A_SUPPORTED_TRAY_COMMANDS,
-    ROBOT_B_IDLE_JOINT_POSITIONS_DEG,
     ROBOT_B_PRIM_PATH,
     ROBOT_B_TRACKING_JOINT1_DELTA_DEG,
     ROBOT_TRANSIT_Y_OFFSET,
@@ -70,8 +68,12 @@ from m0609_config import (
     SAFE_JOINT_RETURN_MAX_STEP_DEG,
     SAFE_JOINT_RETURN_TOLERANCE_DEG,
     TABLE_HEIGHT,
+    EXTERNAL_TOOL_DETECTION_TIMEOUT_SEC,
+    EXTERNAL_TOOL_TRAY_MATCH_RADIUS,
     TOOL_DROP_HEIGHT,
     TOOL_MASS,
+    TOOL_NAMES,
+    TOOL_RANDOM_SEED,
     TOOL_SCALES,
     TOOL_USDS,
     TRACKING_MAX_JOINT_STEP,
@@ -131,6 +133,7 @@ from m0609_tracking_controller import (
 )
 from robot_manager import RobotManager
 from robot_runtime import RobotProfile
+from tool_state_manager import ToolStateManager
 
 
 def _open_full_scene() -> None:
@@ -383,11 +386,38 @@ def main() -> None:
     task = M0609BasicTask()
     world.add_task(task)
 
+    tool_state_manager = ToolStateManager(
+        tray_positions=TRAY_SPAWN_POSITIONS,
+        tool_ids=TOOL_NAMES,
+        random_seed=TOOL_RANDOM_SEED,
+        external_timeout_sec=(
+            EXTERNAL_TOOL_DETECTION_TIMEOUT_SEC
+        ),
+        tray_match_radius=(
+            EXTERNAL_TOOL_TRAY_MATCH_RADIUS
+        ),
+    )
+
+    tool_index_by_name = {
+        tool_name: index
+        for index, tool_name
+        in enumerate(TOOL_NAMES)
+    }
+
+    tray_tool_indices = {
+        tray_id: tool_index_by_name[tool_name]
+        for tray_id, tool_name
+        in tool_state_manager
+        .get_tray_tool_snapshot()
+        .items()
+    }
+
     tray_registry = (
         create_surgical_trays_and_tools(
             world=world,
             tray_usd_path=TRAY_USD_PATH,
             tool_usds=TOOL_USDS,
+            tray_tool_indices=tray_tool_indices,
             tray_positions=(
                 TRAY_SPAWN_POSITIONS
             ),
@@ -438,30 +468,18 @@ def main() -> None:
         world,
     )
 
-    # 씬에 저장된 현재 관절 자세를 IDLE 기준 자세로 사용한다.
-    # initialize_robot() 직후의 순간값을 읽지 않기 때문에,
-    # 시뮬레이션 초기화 타이밍에 따라 IDLE 자세가 달라지지 않는다.
-    initial_joint_positions_a = np.deg2rad(
+    initial_joint_positions_a = (
         np.asarray(
-            ROBOT_A_IDLE_JOINT_POSITIONS_DEG,
+            robot_a.get_joint_positions(),
             dtype=np.float64,
-        )
+        ).copy()
     )
 
-    initial_joint_positions_b = np.deg2rad(
+    initial_joint_positions_b = (
         np.asarray(
-            ROBOT_B_IDLE_JOINT_POSITIONS_DEG,
+            robot_b.get_joint_positions(),
             dtype=np.float64,
-        )
-    )
-
-    print(
-        "[main] IDLE joint positions from config:\n"
-        f" A(deg)="
-        f"{np.degrees(initial_joint_positions_a).round(4)}\n"
-        f" B(deg)="
-        f"{np.degrees(initial_joint_positions_b).round(4)}",
-        flush=True,
+        ).copy()
     )
 
     (
@@ -638,6 +656,7 @@ def main() -> None:
         shared_trays=tuple(
             TRAY_SPAWN_POSITIONS.keys()
         ),
+        tool_state_manager=tool_state_manager,
     )
 
     robot_manager.register_robot(
@@ -765,6 +784,19 @@ def main() -> None:
         "- 거리 동률: Robot B 우선"
     )
     print(
+        "- Tool layout: random initial placement"
+    )
+    print(
+        "- Tool state: TRACKING=held, PLACE=on tray"
+    )
+    print(
+        "- External tool detection API prepared"
+    )
+    print(
+        f"- Initial tools: "
+        f"{tool_state_manager.get_tray_tool_snapshot()}"
+    )
+    print(
         "- Tray zone: 신규 PICK/PLACE 구역 LOCK, 큐 없음"
     )
     print(
@@ -807,13 +839,38 @@ def main() -> None:
             tracking_controller_a.reset()
             tracking_controller_b.reset()
 
-            robot_manager.reset()
+            randomized_layout = robot_manager.reset(
+                randomize_tools=True
+            )
+
+            if randomized_layout is None:
+                raise RuntimeError(
+                    "Tool random layout reset failed"
+                )
+
+            randomized_tool_indices = {
+                tray_id: tool_index_by_name[tool_name]
+                for tray_id, tool_name
+                in randomized_layout.items()
+            }
+
+            tray_registry.reset_tools_to_layout(
+                tray_tool_indices=(
+                    randomized_tool_indices
+                ),
+                tray_positions=(
+                    TRAY_SPAWN_POSITIONS
+                ),
+                tool_drop_height=(
+                    TOOL_DROP_HEIGHT
+                ),
+            )
 
             right_hand_marker.reset()
             left_hand_marker.reset()
 
             print(
-                "[main] Robot A/B "
+                "[main] Robot A/B 및 도구 랜덤 배치 "
                 "Play 재초기화 완료",
                 flush=True,
             )

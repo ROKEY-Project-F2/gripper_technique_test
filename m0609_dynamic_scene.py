@@ -134,11 +134,19 @@ class TrayRecord:
     top_offset_z: float
 
 
+@dataclass
+class ToolRecord:
+    tool_index: int
+    rigid_object: object
+    spawn_orientation: np.ndarray
+
+
 class DynamicTrayRegistry:
     """트레이의 현재 pose와 생성 당시 pose를 ID별로 관리한다."""
 
     def __init__(self) -> None:
         self._records: Dict[int, TrayRecord] = {}
+        self._tool_records: Dict[int, ToolRecord] = {}
 
     def register_tray(
         self,
@@ -163,6 +171,95 @@ class DynamicTrayRegistry:
                 dtype=np.float64,
             ).copy(),
             top_offset_z=float(top_offset_z),
+        )
+
+    def register_tool(
+        self,
+        *,
+        tool_index: int,
+        rigid_object,
+        spawn_orientation: Sequence[float],
+    ) -> None:
+        tool_index = int(tool_index)
+
+        self._tool_records[tool_index] = ToolRecord(
+            tool_index=tool_index,
+            rigid_object=rigid_object,
+            spawn_orientation=np.asarray(
+                spawn_orientation,
+                dtype=np.float64,
+            ).copy(),
+        )
+
+    def reset_tools_to_layout(
+        self,
+        *,
+        tray_tool_indices: Mapping[int, int],
+        tray_positions: Mapping[
+            int,
+            Sequence[float],
+        ],
+        tool_drop_height: float,
+    ) -> None:
+        """
+        새 랜덤 배치에 맞춰 실제 도구 Prim을 각 트레이 위로 옮긴다.
+        """
+        assigned_tools = set()
+
+        for tray_id, tool_index in sorted(
+            tray_tool_indices.items()
+        ):
+            tray_id = int(tray_id)
+            tool_index = int(tool_index)
+
+            if tool_index in assigned_tools:
+                raise ValueError(
+                    f"tool_index={tool_index}가 중복 배정됐습니다"
+                )
+
+            if tool_index not in self._tool_records:
+                raise KeyError(
+                    f"등록되지 않은 tool_index={tool_index}"
+                )
+
+            if tray_id not in tray_positions:
+                raise KeyError(
+                    f"등록되지 않은 tray_id={tray_id}"
+                )
+
+            assigned_tools.add(tool_index)
+            record = self._tool_records[tool_index]
+
+            tray_position = np.asarray(
+                tray_positions[tray_id],
+                dtype=np.float64,
+            )
+
+            tool_position = (
+                tray_position
+                + np.array(
+                    [
+                        0.0,
+                        0.0,
+                        float(tool_drop_height),
+                    ],
+                    dtype=np.float64,
+                )
+            )
+
+            record.rigid_object.set_world_pose(
+                position=tool_position,
+                orientation=record.spawn_orientation,
+            )
+
+            _clear_velocity(
+                record.rigid_object
+            )
+
+        print(
+            "[DynamicScene] tool layout reset: "
+            f"{dict(sorted(tray_tool_indices.items()))}",
+            flush=True,
         )
 
     def has_tray(
@@ -485,12 +582,15 @@ def _create_tool_reference(
         mass=tool_mass,
     )
 
+    return target_path
+
 
 def create_surgical_trays_and_tools(
     *,
     world: World,
     tray_usd_path: str,
     tool_usds: Sequence[str],
+    tray_tool_indices: Mapping[int, int],
     tray_positions: Mapping[
         int,
         Sequence[float],
@@ -619,25 +719,55 @@ def create_surgical_trays_and_tools(
             )
         )
 
-        _create_tool_reference(
+        if tray_id not in tray_tool_indices:
+            raise KeyError(
+                f"tray_tool_indices에 tray={tray_id}가 없습니다"
+            )
+
+        tool_index = int(
+            tray_tool_indices[tray_id]
+        )
+
+        if not 0 <= tool_index < len(tool_usds):
+            raise IndexError(
+                f"잘못된 tool_index={tool_index}, tray={tray_id}"
+            )
+
+        tool_prim_path = _create_tool_reference(
             stage=stage,
-            tool_id=tray_id,
-            tool_usd_path=tool_usds[tray_id],
+            tool_id=tool_index,
+            tool_usd_path=tool_usds[tool_index],
             tool_position=tool_position,
             tool_orientation=tool_orientation,
-            tool_scale=tool_scales[tray_id],
+            tool_scale=tool_scales[tool_index],
             tool_mass=tool_mass,
+        )
+
+        tool_rigid = world.scene.add(
+            SingleRigidPrim(
+                prim_path=tool_prim_path,
+                name=f"tool_{tool_index}",
+                position=tool_position,
+                orientation=tool_orientation,
+            )
+        )
+
+        registry.register_tool(
+            tool_index=tool_index,
+            rigid_object=tool_rigid,
+            spawn_orientation=tool_orientation,
         )
 
         print(
             f"[DynamicScene] tray={tray_id}, "
+            f"tool_index={tool_index}, "
             f"position={position.tolist()}, "
             f"tray_orientation="
             f"{tray_orientation.round(5).tolist()}, "
             f"tool_orientation="
             f"{tool_orientation.round(5).tolist()}, "
-            f"tool={Path(tool_usds[tray_id]).name}, "
-            f"scale={tuple(tool_scales[tray_id])}",
+            f"tool={Path(tool_usds[tool_index]).name}, "
+            f"scale={tuple(tool_scales[tool_index])}",
             flush=True,
         )
 

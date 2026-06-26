@@ -188,6 +188,17 @@ TOOL_NAMES = (
     "메스",
 )
 
+# 도구 초기 랜덤 배치 설정.
+# None이면 실행할 때마다 다른 배치가 생성된다.
+# 정수값을 넣으면 같은 랜덤 배치를 재현할 수 있다.
+TOOL_RANDOM_SEED = None
+
+# 외부 도구 인식값이 최신으로 인정되는 시간.
+EXTERNAL_TOOL_DETECTION_TIMEOUT_SEC = 1.0
+
+# 외부 좌표만 들어왔을 때 가장 가까운 트레이로 판단할 최대 거리.
+EXTERNAL_TOOL_TRAY_MATCH_RADIUS = 0.18
+
 TOOL_DROP_HEIGHT = 0.05
 TOOL_MASS = 0.001
 
@@ -254,35 +265,6 @@ ROBOT_B_SUPPORTED_TRAY_COMMANDS = (
     5,
 )
 
-
-
-# ============================================================
-# IDLE 관절 자세
-#
-# full_scene(3).usda에 저장된 현재 관절 targetPosition과 동일하다.
-# 단위는 degree이며 main.py에서 radian으로 변환해서 사용한다.
-#
-# Robot A = /World/m0609_01
-# Robot B = /World/m0609
-# ============================================================
-
-ROBOT_A_IDLE_JOINT_POSITIONS_DEG = (
-    88.0,
-    0.1,
-    -90.0,
-    0.0,
-    -96.0,
-    0.0,
-)
-
-ROBOT_B_IDLE_JOINT_POSITIONS_DEG = (
-    -96.0,
-    3.7,
-    88.1,
-    0.0,
-    100.200005,
-    -300.6,
-)
 
 # ============================================================
 # 로봇 위쪽 중간 경유지 설정

@@ -7,6 +7,7 @@ from typing import Dict, Mapping, Optional, Sequence, Tuple
 import numpy as np
 
 from robot_runtime import RobotProfile, RobotTask
+from tool_state_manager import ToolStateManager
 
 
 @dataclass
@@ -15,6 +16,7 @@ class ManagedRobot:
     state_machine: object
     active_task: Optional[RobotTask] = None
     last_state: str = "IDLE"
+    last_place_release_sequence: int = 0
 
 
 class RobotManager:
@@ -31,8 +33,10 @@ class RobotManager:
 
     유지되는 기능:
     - 두 로봇 모두 Tray 0~5 접근
-    - 가까운 IDLE 로봇 선택
-    - 거리 동률이면 Robot B 우선
+    - 담당 트레이 우선 로봇 선택
+      · Tray 0/2/4: Robot A 우선
+      · Tray 1/3/5: Robot B 우선
+    - 우선 로봇이 바쁘면 다른 IDLE 로봇이 대신 수행
     - 신규 트레이 PICK/PLACE 구역 락
     - 신규 락은 큐 없이 단순 차단
     """
@@ -45,8 +49,14 @@ class RobotManager:
             Sequence[float],
         ],
         shared_trays: Sequence[int] = (),
+        tool_state_manager: Optional[
+            ToolStateManager
+        ] = None,
     ) -> None:
         self._robots: Dict[str, ManagedRobot] = {}
+        self._tool_state_manager = (
+            tool_state_manager
+        )
 
         self._tray_positions = {
             int(tray_id): np.asarray(
@@ -120,6 +130,13 @@ class RobotManager:
             profile=profile,
             state_machine=state_machine,
             last_state=state_machine.state_name,
+            last_place_release_sequence=int(
+                getattr(
+                    state_machine,
+                    "place_release_sequence",
+                    0,
+                )
+            ),
         )
 
         print(
@@ -174,15 +191,32 @@ class RobotManager:
         )
 
     @staticmethod
-    def _robot_tie_priority(
+    def _preferred_robot_priority(
+        *,
         robot_id: str,
+        tray_id: int,
     ) -> int:
-        normalized = str(robot_id).strip().upper()
+        """
+        두 로봇이 모두 명령을 받을 수 있을 때 적용되는
+        트레이별 담당 우선순위.
 
-        if normalized == "B":
+        Tray 0, 2, 4 -> Robot A 우선
+        Tray 1, 3, 5 -> Robot B 우선
+
+        우선 로봇이 바쁘면 후보 목록에서 제외되므로,
+        다른 로봇이 자동으로 대신 수행한다.
+        """
+        normalized = str(robot_id).strip().upper()
+        preferred_robot = (
+            "A"
+            if int(tray_id) % 2 == 0
+            else "B"
+        )
+
+        if normalized == preferred_robot:
             return 0
 
-        if normalized == "A":
+        if normalized in {"A", "B"}:
             return 1
 
         return 2
@@ -211,12 +245,15 @@ class RobotManager:
 
         candidates.sort(
             key=lambda managed: (
+                self._preferred_robot_priority(
+                    robot_id=(
+                        managed.profile.robot_id
+                    ),
+                    tray_id=tray_id,
+                ),
                 self._distance_to_tray(
                     managed=managed,
                     tray_id=tray_id,
-                ),
-                self._robot_tie_priority(
-                    managed.profile.robot_id
                 ),
                 managed.profile.robot_id,
             )
@@ -385,6 +422,22 @@ class RobotManager:
             )
             return False, message
 
+        if (
+            self._tool_state_manager is not None
+            and self._tool_state_manager.get_tool_for_tray(
+                tray_index
+            ) is None
+        ):
+            message = (
+                f"Tray {tray_index} is empty"
+            )
+
+            print(
+                f"[Manager BLOCK] {message}",
+                flush=True,
+            )
+            return False, message
+
         candidates = self._find_candidate_robots(
             tray_index
         )
@@ -487,6 +540,60 @@ class RobotManager:
         )
         return False, message
 
+    def request_tool_command(
+        self,
+        tool_id: str,
+    ) -> Tuple[bool, str]:
+        if self._tool_state_manager is None:
+            return (
+                False,
+                "ToolStateManager is not configured",
+            )
+
+        tray_id = (
+            self._tool_state_manager
+            .get_tray_for_tool(tool_id)
+        )
+
+        if tray_id is None:
+            return (
+                False,
+                f"Tool is not available on a tray: {tool_id}",
+            )
+
+        return self.request_pick_command(
+            tray_id
+        )
+
+    def update_external_tool_detection(
+        self,
+        *,
+        tool_id: str,
+        position: Sequence[float],
+        tray_id: Optional[int] = None,
+        timestamp: Optional[float] = None,
+    ) -> None:
+        if self._tool_state_manager is None:
+            raise RuntimeError(
+                "ToolStateManager is not configured"
+            )
+
+        self._tool_state_manager.update_external_detection(
+            tool_id=tool_id,
+            position=position,
+            tray_id=tray_id,
+            timestamp=timestamp,
+        )
+
+    def get_tool_state_snapshot(self) -> dict:
+        if self._tool_state_manager is None:
+            return {}
+
+        return (
+            self._tool_state_manager
+            .get_debug_snapshot()
+        )
+
     def request_move(
         self,
         x: float,
@@ -500,6 +607,9 @@ class RobotManager:
         )
 
     def step(self) -> None:
+        if self._tool_state_manager is not None:
+            self._tool_state_manager.synchronize_external_state()
+
         for managed in self._robots.values():
             robot_id = managed.profile.robot_id
             previous_state = (
@@ -520,6 +630,43 @@ class RobotManager:
 
             managed.state_machine.step()
 
+            current_release_sequence = int(
+                getattr(
+                    managed.state_machine,
+                    "place_release_sequence",
+                    0,
+                )
+            )
+
+            if (
+                current_release_sequence
+                != managed.last_place_release_sequence
+            ):
+                managed.last_place_release_sequence = (
+                    current_release_sequence
+                )
+
+                if self._tool_state_manager is not None:
+                    if managed.active_task is None:
+                        raise RuntimeError(
+                            "PLACE release confirmed without active task: "
+                            f"robot={robot_id}"
+                        )
+
+                    # 실제 해제가 확인된 이 로봇의 도구만
+                    # HELD_BY_ROBOT -> 해당 트레이로 복귀시킨다.
+                    self._tool_state_manager.on_place_enter(
+                        robot_id=robot_id,
+                        tray_id=managed.active_task.tray_id,
+                    )
+
+                    self._tool_state_manager.print_tool_locations(
+                        title=(
+                            "physical PLACE release confirmed "
+                            f"by Robot {robot_id}"
+                        )
+                    )
+
             current_state = (
                 managed.state_machine.state_name
             )
@@ -533,6 +680,27 @@ class RobotManager:
                 )
 
                 managed.last_state = current_state
+
+            if (
+                self._tool_state_manager is not None
+                and managed.active_task is not None
+            ):
+                if (
+                    previous_state == "PICK"
+                    and current_state == "TRACKING"
+                ):
+                    self._tool_state_manager.on_tracking_enter(
+                        robot_id=robot_id,
+                        tray_id=managed.active_task.tray_id,
+                    )
+
+                elif (
+                    previous_state == "TRACKING"
+                    and current_state == "PLACE"
+                ):
+                    # 실제 그리퍼 해제가 확인될 때까지
+                    # 해당 로봇의 도구는 HELD_BY_ROBOT으로 유지한다.
+                    pass
 
             self._release_tray_zone_after_transition(
                 managed=managed,
@@ -563,7 +731,11 @@ class RobotManager:
 
                 managed.active_task = None
 
-    def reset(self) -> None:
+    def reset(
+        self,
+        *,
+        randomize_tools: bool = False,
+    ) -> Optional[Dict[int, str]]:
         self._tray_zone_owner = None
 
         for managed in self._robots.values():
@@ -572,12 +744,37 @@ class RobotManager:
             managed.last_state = (
                 managed.state_machine.state_name
             )
+            managed.last_place_release_sequence = int(
+                getattr(
+                    managed.state_machine,
+                    "place_release_sequence",
+                    0,
+                )
+            )
+
+        tool_layout = None
+
+        if (
+            randomize_tools
+            and self._tool_state_manager is not None
+        ):
+            tool_layout = (
+                self._tool_state_manager
+                .reset_random_layout()
+            )
 
         print(
             "[Manager] reset: "
-            "tray-zone lock cleared",
+            "tray-zone lock cleared"
+            + (
+                ", tools randomized"
+                if tool_layout is not None
+                else ""
+            ),
             flush=True,
         )
+
+        return tool_layout
 
     def get_tray_zone_owner(
         self,
