@@ -13,7 +13,11 @@ GRAPH_PATH = "/World/ROS_M0609_Graph"
 
 COMMAND_TOPIC = "/m0609/move_command"
 RESULT_TOPIC = "/m0609/move_result"
+# 도구 이름/ID 기반 명령 토픽
 PICK_COMMAND_TOPIC = "/m0609/pick_command"
+RETURN_TOOL_TOPIC = "/m0609/return_tool"
+RETURN_RECENT_TOPIC = "/m0609/return_recent"
+TOOL_COMMAND_RESULT_TOPIC = "/m0609/tool_command_result"
 
 LEFT_HAND_RAW_TOPIC = "/left_hand_raw"
 LEFT_HAND_TARGET_TOPIC = "/left_hand_xyz"
@@ -342,37 +346,116 @@ def compute(db):
 
 
 _PICK_COMMAND_SCRIPT = r"""
+import json
+from m0609_ros_bridge import get_command_manager
+
+
+def compute(db):
+    tool_id = str(db.inputs.command).strip()
+
+    try:
+        manager = get_command_manager()
+        if manager is None:
+            raise RuntimeError("Robot manager is not registered")
+
+        accepted, message = manager.request_tool_command(tool_id)
+        status = manager.get_tool_command_status(tool_id)
+
+        result = {
+            "command": "REQUEST_TOOL",
+            "tool_id": tool_id,
+            "accepted": bool(accepted),
+            "status": status.get("status", "UNKNOWN"),
+            "robot_id": status.get("robot_id"),
+            "operation_id": status.get("operation_id"),
+            "message": str(message),
+        }
+    except Exception as error:
+        result = {
+            "command": "REQUEST_TOOL",
+            "tool_id": tool_id,
+            "accepted": False,
+            "status": "ERROR",
+            "message": str(error),
+        }
+
+    db.outputs.result = json.dumps(result, ensure_ascii=False)
+    print(f"[ROS2 Bridge] tool result: {db.outputs.result}", flush=True)
+    return True
+"""
+
+
+_RETURN_TOOL_SCRIPT = r"""
+import json
+from m0609_ros_bridge import get_command_manager
+
+
+def compute(db):
+    tool_id = str(db.inputs.command).strip()
+
+    try:
+        manager = get_command_manager()
+        if manager is None:
+            raise RuntimeError("Robot manager is not registered")
+
+        accepted, message = manager.request_tool_return(tool_id)
+        status = manager.get_tool_command_status(tool_id)
+
+        result = {
+            "command": "RETURN_TOOL",
+            "tool_id": tool_id,
+            "accepted": bool(accepted),
+            "status": status.get("status", "UNKNOWN"),
+            "robot_id": status.get("robot_id"),
+            "operation_id": status.get("operation_id"),
+            "message": str(message),
+        }
+    except Exception as error:
+        result = {
+            "command": "RETURN_TOOL",
+            "tool_id": tool_id,
+            "accepted": False,
+            "status": "ERROR",
+            "message": str(error),
+        }
+
+    db.outputs.result = json.dumps(result, ensure_ascii=False)
+    print(f"[ROS2 Bridge] return result: {db.outputs.result}", flush=True)
+    return True
+"""
+
+
+_RETURN_RECENT_SCRIPT = r"""
+import json
 from m0609_ros_bridge import get_command_manager
 
 
 def compute(db):
     try:
-        tray_index = int(db.inputs.command)
-
         manager = get_command_manager()
-
         if manager is None:
             raise RuntimeError("Robot manager is not registered")
 
-        accepted, message = manager.request_pick_command(
-            tray_index
-        )
+        accepted, message = manager.request_recent_tool_return()
 
-        print(
-            "[ROS2 Bridge] pick command:"
-            f" tray={tray_index},"
-            f" accepted={accepted},"
-            f" message={message}",
-            flush=True,
-        )
-
+        result = {
+            "command": "RETURN_RECENT",
+            "tool_id": None,
+            "accepted": bool(accepted),
+            "status": "ACCEPTED" if accepted else "REJECTED",
+            "message": str(message),
+        }
     except Exception as error:
-        print(
-            "[ROS2 Bridge] pick command error: "
-            f"{error}",
-            flush=True,
-        )
+        result = {
+            "command": "RETURN_RECENT",
+            "tool_id": None,
+            "accepted": False,
+            "status": "ERROR",
+            "message": str(error),
+        }
 
+    db.outputs.result = json.dumps(result, ensure_ascii=False)
+    print(f"[ROS2 Bridge] recent return result: {db.outputs.result}", flush=True)
     return True
 """
 
@@ -515,7 +598,47 @@ def _create_script_ports() -> None:
     og.Controller.create_attribute(
         node=pick_node,
         attr_name="inputs:command",
-        attr_type="int",
+        attr_type=STRING_TYPE,
+    )
+    og.Controller.create_attribute(
+        node=pick_node,
+        attr_name="outputs:result",
+        attr_type=STRING_TYPE,
+        attr_port=(
+            og.AttributePortType
+            .ATTRIBUTE_PORT_TYPE_OUTPUT
+        ),
+    )
+
+    return_tool_node = og.Controller.node(
+        f"{GRAPH_PATH}/HandleReturnTool"
+    )
+    og.Controller.create_attribute(
+        node=return_tool_node,
+        attr_name="inputs:command",
+        attr_type=STRING_TYPE,
+    )
+    og.Controller.create_attribute(
+        node=return_tool_node,
+        attr_name="outputs:result",
+        attr_type=STRING_TYPE,
+        attr_port=(
+            og.AttributePortType
+            .ATTRIBUTE_PORT_TYPE_OUTPUT
+        ),
+    )
+
+    return_recent_node = og.Controller.node(
+        f"{GRAPH_PATH}/HandleReturnRecent"
+    )
+    og.Controller.create_attribute(
+        node=return_recent_node,
+        attr_name="outputs:result",
+        attr_type=STRING_TYPE,
+        attr_port=(
+            og.AttributePortType
+            .ATTRIBUTE_PORT_TYPE_OUTPUT
+        ),
     )
 
     for node_name in (
@@ -622,6 +745,34 @@ def setup_m0609_ros_bridge(
             "HandlePickCommand",
             "omni.graph.scriptnode.ScriptNode",
         ),
+        (
+            "ReturnToolSubscriber",
+            "isaacsim.ros2.bridge.ROS2Subscriber",
+        ),
+        (
+            "HandleReturnTool",
+            "omni.graph.scriptnode.ScriptNode",
+        ),
+        (
+            "ReturnRecentSubscriber",
+            "isaacsim.ros2.bridge.ROS2Subscriber",
+        ),
+        (
+            "HandleReturnRecent",
+            "omni.graph.scriptnode.ScriptNode",
+        ),
+        (
+            "PickResultPublisher",
+            "isaacsim.ros2.bridge.ROS2Publisher",
+        ),
+        (
+            "ReturnToolResultPublisher",
+            "isaacsim.ros2.bridge.ROS2Publisher",
+        ),
+        (
+            "ReturnRecentResultPublisher",
+            "isaacsim.ros2.bridge.ROS2Publisher",
+        ),
     ]
 
     hand_nodes = (
@@ -696,7 +847,7 @@ def setup_m0609_ros_bridge(
         ),
         (
             "PickCommandSubscriber.inputs:messageName",
-            "Int32",
+            "String",
         ),
         (
             "PickCommandSubscriber.inputs:topicName",
@@ -705,6 +856,94 @@ def setup_m0609_ros_bridge(
         (
             "HandlePickCommand.inputs:script",
             _PICK_COMMAND_SCRIPT,
+        ),
+        (
+            "ReturnToolSubscriber.inputs:messagePackage",
+            "std_msgs",
+        ),
+        (
+            "ReturnToolSubscriber.inputs:messageSubfolder",
+            "msg",
+        ),
+        (
+            "ReturnToolSubscriber.inputs:messageName",
+            "String",
+        ),
+        (
+            "ReturnToolSubscriber.inputs:topicName",
+            RETURN_TOOL_TOPIC,
+        ),
+        (
+            "HandleReturnTool.inputs:script",
+            _RETURN_TOOL_SCRIPT,
+        ),
+        (
+            "ReturnRecentSubscriber.inputs:messagePackage",
+            "std_msgs",
+        ),
+        (
+            "ReturnRecentSubscriber.inputs:messageSubfolder",
+            "msg",
+        ),
+        (
+            "ReturnRecentSubscriber.inputs:messageName",
+            "Empty",
+        ),
+        (
+            "ReturnRecentSubscriber.inputs:topicName",
+            RETURN_RECENT_TOPIC,
+        ),
+        (
+            "HandleReturnRecent.inputs:script",
+            _RETURN_RECENT_SCRIPT,
+        ),
+        (
+            "PickResultPublisher.inputs:messagePackage",
+            "std_msgs",
+        ),
+        (
+            "PickResultPublisher.inputs:messageSubfolder",
+            "msg",
+        ),
+        (
+            "PickResultPublisher.inputs:messageName",
+            "String",
+        ),
+        (
+            "PickResultPublisher.inputs:topicName",
+            TOOL_COMMAND_RESULT_TOPIC,
+        ),
+        (
+            "ReturnToolResultPublisher.inputs:messagePackage",
+            "std_msgs",
+        ),
+        (
+            "ReturnToolResultPublisher.inputs:messageSubfolder",
+            "msg",
+        ),
+        (
+            "ReturnToolResultPublisher.inputs:messageName",
+            "String",
+        ),
+        (
+            "ReturnToolResultPublisher.inputs:topicName",
+            TOOL_COMMAND_RESULT_TOPIC,
+        ),
+        (
+            "ReturnRecentResultPublisher.inputs:messagePackage",
+            "std_msgs",
+        ),
+        (
+            "ReturnRecentResultPublisher.inputs:messageSubfolder",
+            "msg",
+        ),
+        (
+            "ReturnRecentResultPublisher.inputs:messageName",
+            "String",
+        ),
+        (
+            "ReturnRecentResultPublisher.inputs:topicName",
+            TOOL_COMMAND_RESULT_TOPIC,
         ),
     ]
 
@@ -828,6 +1067,14 @@ def setup_m0609_ros_bridge(
             "OnPlaybackTick.outputs:tick",
             "PickCommandSubscriber.inputs:execIn",
         ),
+        (
+            "OnPlaybackTick.outputs:tick",
+            "ReturnToolSubscriber.inputs:execIn",
+        ),
+        (
+            "OnPlaybackTick.outputs:tick",
+            "ReturnRecentSubscriber.inputs:execIn",
+        ),
     ]
 
     context_connections = [
@@ -842,6 +1089,26 @@ def setup_m0609_ros_bridge(
         (
             "ROS2Context.outputs:context",
             "PickCommandSubscriber.inputs:context",
+        ),
+        (
+            "ROS2Context.outputs:context",
+            "ReturnToolSubscriber.inputs:context",
+        ),
+        (
+            "ROS2Context.outputs:context",
+            "ReturnRecentSubscriber.inputs:context",
+        ),
+        (
+            "ROS2Context.outputs:context",
+            "PickResultPublisher.inputs:context",
+        ),
+        (
+            "ROS2Context.outputs:context",
+            "ReturnToolResultPublisher.inputs:context",
+        ),
+        (
+            "ROS2Context.outputs:context",
+            "ReturnRecentResultPublisher.inputs:context",
         ),
     ]
 
@@ -951,6 +1218,96 @@ def setup_m0609_ros_bridge(
                 "inputs:command",
             ),
         ),
+        (
+            path(
+                "ReturnToolSubscriber",
+                "outputs:execOut",
+            ),
+            path(
+                "HandleReturnTool",
+                "inputs:execIn",
+            ),
+        ),
+        (
+            path(
+                "ReturnToolSubscriber",
+                "outputs:data",
+            ),
+            path(
+                "HandleReturnTool",
+                "inputs:command",
+            ),
+        ),
+        (
+            path(
+                "ReturnRecentSubscriber",
+                "outputs:execOut",
+            ),
+            path(
+                "HandleReturnRecent",
+                "inputs:execIn",
+            ),
+        ),
+        (
+            path(
+                "HandlePickCommand",
+                "outputs:execOut",
+            ),
+            path(
+                "PickResultPublisher",
+                "inputs:execIn",
+            ),
+        ),
+        (
+            path(
+                "HandlePickCommand",
+                "outputs:result",
+            ),
+            path(
+                "PickResultPublisher",
+                "inputs:data",
+            ),
+        ),
+        (
+            path(
+                "HandleReturnTool",
+                "outputs:execOut",
+            ),
+            path(
+                "ReturnToolResultPublisher",
+                "inputs:execIn",
+            ),
+        ),
+        (
+            path(
+                "HandleReturnTool",
+                "outputs:result",
+            ),
+            path(
+                "ReturnToolResultPublisher",
+                "inputs:data",
+            ),
+        ),
+        (
+            path(
+                "HandleReturnRecent",
+                "outputs:execOut",
+            ),
+            path(
+                "ReturnRecentResultPublisher",
+                "inputs:execIn",
+            ),
+        ),
+        (
+            path(
+                "HandleReturnRecent",
+                "outputs:result",
+            ),
+            path(
+                "ReturnRecentResultPublisher",
+                "inputs:data",
+            ),
+        ),
     ]
 
     vector_connections = (
@@ -1057,7 +1414,14 @@ def setup_m0609_ros_bridge(
 
     print(
         "[ROS2 Bridge] ready:\n"
-        f" pick command: {PICK_COMMAND_TOPIC}\n"
+        f" tool request: {PICK_COMMAND_TOPIC} "
+        "(std_msgs/String)\n"
+        f" tool return: {RETURN_TOOL_TOPIC} "
+        "(std_msgs/String)\n"
+        f" recent return: {RETURN_RECENT_TOPIC} "
+        "(std_msgs/Empty)\n"
+        f" command result: {TOOL_COMMAND_RESULT_TOPIC} "
+        "(std_msgs/String)\n"
         f" left raw: {LEFT_HAND_RAW_TOPIC}\n"
         f" left target: {LEFT_HAND_TARGET_TOPIC}\n"
         f" left mode: {LEFT_HAND_MODE_TOPIC}\n"

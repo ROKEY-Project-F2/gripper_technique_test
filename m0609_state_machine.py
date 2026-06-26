@@ -15,7 +15,13 @@ from robot_runtime import RobotTask
 
 class M0609State(Enum):
     IDLE = auto()
-    PICK = auto()
+
+    # 도구 흡착 완료 전
+    PICK_APPROACH = auto()
+
+    # 도구 흡착 완료 후 TRACKING 위치까지 운반
+    PICK_TRANSPORT = auto()
+
     TRACKING = auto()
     PLACE = auto()
     RETURN_HOME = auto()
@@ -231,6 +237,10 @@ class M0609StateMachine:
 
         # 집은 뒤 경유지에서 180도 회전하기 전 joint1 각도.
         self._joint1_before_tracking: Optional[float] = None
+
+        # 도구 흡착 후 운반 경유지 도착 여부.
+        # PICK_TRANSPORT 취소 경로를 구분하는 데 사용한다.
+        self._transport_transit_reached = False
         self._joint1_target: Optional[float] = None
 
         # 집기 전/PLACE 후 경유지 이동에서 유지할 EE orientation.
@@ -260,6 +270,23 @@ class M0609StateMachine:
 
         self._last_hand_mode_sequence = -1
         self._tracking_error_reported = False
+
+        # RobotManager가 교체 요청을 받았을 때 설정한다.
+        # TRACKING 상태의 다음 step에서 PLACE로 전환한다.
+        self._manager_place_requested = False
+
+        # PLACE 요청이 들어온 당시의 상위 상태.
+        # PICK_TRANSPORT 취소 시 현재 세부 단계에 맞는
+        # PLACE 진입 경로를 선택하는 데 사용한다.
+        self._place_request_source_state = None
+
+        # PICK_APPROACH 중 반납/취소 요청.
+        # 아직 도구를 집지 않았으므로 PLACE 없이 RETURN_HOME으로 간다.
+        self._cancel_pick_approach_requested = False
+
+        # 교체 작업일 때만 PLACE 완료 후 RETURN_HOME을 생략하고
+        # 현재 안전 복귀 자세에서 바로 다음 PICK을 받을 수 있게 한다.
+        self._skip_return_home_once = False
 
         self._release_wait_frames = 0
         self._release_stable_frames = 0
@@ -334,6 +361,99 @@ class M0609StateMachine:
         return (
             True,
             f"Tray {task.tray_id} accepted",
+        )
+
+    def request_place_from_manager(
+        self,
+        *,
+        skip_return_home: bool = False,
+    ) -> Tuple[bool, str]:
+        """
+        도구를 이미 집은 상태에서 PLACE를 요청한다.
+
+        허용 상태:
+        - PICK_TRANSPORT
+        - TRACKING
+        """
+        if self._state not in {
+            M0609State.PICK_TRANSPORT,
+            M0609State.TRACKING,
+        }:
+            return (
+                False,
+                f"PLACE request rejected in {self._state.name}",
+            )
+
+        if self._manager_place_requested:
+            return (
+                True,
+                "PLACE request is already pending",
+            )
+
+        self._manager_place_requested = True
+        self._place_request_source_state = self._state
+        self._skip_return_home_once = bool(
+            skip_return_home
+        )
+
+        print(
+            f"[StateMachine {self.robot_id}] "
+            f"manager requested {self._state.name} -> PLACE, "
+            f"skip_return_home="
+            f"{self._skip_return_home_once}",
+            flush=True,
+        )
+
+        return (
+            True,
+            "PLACE request accepted",
+        )
+
+    def request_cancel_and_return_from_manager(
+        self,
+    ) -> Tuple[bool, str]:
+        """
+        기존 반납 토픽에서 호출하는 작업 취소/반납 진입점.
+
+        PICK_APPROACH:
+            도구를 아직 집지 않았으므로 PICK을 중단하고
+            RETURN_HOME으로 간다.
+
+        PICK_TRANSPORT / TRACKING:
+            도구를 들고 있으므로 PLACE 후 RETURN_HOME으로 간다.
+        """
+        if self._state == M0609State.PICK_APPROACH:
+            if self._cancel_pick_approach_requested:
+                return (
+                    True,
+                    "PICK_APPROACH cancellation is already pending",
+                )
+
+            self._cancel_pick_approach_requested = True
+
+            print(
+                f"[StateMachine {self.robot_id}] "
+                "manager requested PICK_APPROACH cancel "
+                "-> RETURN_HOME",
+                flush=True,
+            )
+
+            return (
+                True,
+                "PICK_APPROACH cancellation accepted",
+            )
+
+        if self._state in {
+            M0609State.PICK_TRANSPORT,
+            M0609State.TRACKING,
+        }:
+            return self.request_place_from_manager(
+                skip_return_home=False
+            )
+
+        return (
+            False,
+            f"Cancel/return rejected in {self._state.name}",
         )
 
     def request_move(
@@ -757,6 +877,7 @@ class M0609StateMachine:
         )
 
     def _on_enter_pick(self) -> None:
+        self._transport_transit_reached = False
         if self._pending_pick_index is None:
             raise RuntimeError(
                 "PICK entered without command"
@@ -864,12 +985,69 @@ class M0609StateMachine:
             flush=True,
         )
 
+    def _enter_place_from_pick_transport(self) -> None:
+        """
+        도구 흡착 후 PICK_TRANSPORT 중 취소된 경우의 PLACE 진입.
+
+        경유지 도착 전:
+            진행 중인 경유지 이동을 취소하고,
+            트레이의 PLACE 상단 위치로 직접 복귀한다.
+
+        경유지 도착 후:
+            운반을 위해 움직였던 joint1만 역회전하여
+            경유지 관절 자세를 복원한 뒤 PLACE를 수행한다.
+        """
+        if not self._transport_transit_reached:
+            high, _, _ = self._calculate_place_targets()
+
+            self._set_move_target(
+                high,
+                self._place_tool_orientation,
+            )
+            self._place_phase = PlacePhase.MOVE_HIGH
+
+            print(
+                f"[PLACE {self.robot_id}] "
+                "흡착 후 경유지 도착 전 취소: "
+                "경유지 이동 중단 -> 트레이 PLACE 상단으로 직접 복귀",
+                flush=True,
+            )
+            return
+
+        # 경유지 도착 이후에는 joint1만 운반 방향으로 움직인다.
+        # 취소 시 해당 joint1만 반대로 돌려 경유지 자세를 복원한다.
+        if self._joint1_before_tracking is None:
+            raise RuntimeError(
+                "joint1 return angle is missing "
+                "after transport transit arrival"
+            )
+
+        self._start_joint1_rotation(
+            self._joint1_before_tracking
+        )
+        self._place_phase = (
+            PlacePhase.ROTATE_JOINT1_BACK
+        )
+
+        print(
+            f"[PLACE {self.robot_id}] "
+            "경유지 도착 후 취소: "
+            "운반 joint1만 역회전 -> 경유지 -> 트레이 PLACE",
+            flush=True,
+        )
+
     def _on_enter_place(self) -> None:
+        self._manager_place_requested = False
         self._release_wait_frames = 0
         self._release_stable_frames = 0
         self._release_timeout_reported = False
 
-        if self._is_side_route():
+        source_state = self._place_request_source_state
+        self._place_request_source_state = None
+
+        if source_state == M0609State.PICK_TRANSPORT:
+            self._enter_place_from_pick_transport()
+        elif self._is_side_route():
             self._enter_side_place()
         else:
             self._enter_center_place()
@@ -885,9 +1063,29 @@ class M0609StateMachine:
 
     def _step_idle(self) -> None:
         if self._pending_pick_index is not None:
-            self._change_state(M0609State.PICK)
+            self._change_state(
+                M0609State.PICK_APPROACH
+            )
 
-    def _step_pick(self) -> None:
+    def _step_pick_approach(self) -> None:
+        if self._cancel_pick_approach_requested:
+            self._cancel_pick_approach_requested = False
+            self.pick_place_controller.reset()
+            self.move_controller.reset()
+
+            print(
+                f"[CANCEL {self.robot_id}] "
+                "PICK_APPROACH 중단, 도구 미흡착 상태로 "
+                "RETURN_HOME",
+                flush=True,
+            )
+
+            self._clear_active_tray()
+            self._change_state(
+                M0609State.RETURN_HOME
+            )
+            return
+
         if (
             self._pick_position is None
             or self._pick_orientation is None
@@ -975,16 +1173,31 @@ class M0609StateMachine:
 
                 print(
                     f"[PICK {self.robot_id}] "
-                    "흡착 완료, 저장 자세 유지하며 경유지 이동",
+                    "흡착 완료, PICK_TRANSPORT 진입",
                     flush=True,
                 )
 
-        elif self._pick_phase == PickPhase.MOVE_TRANSIT:
+                self._change_state(
+                    M0609State.PICK_TRANSPORT
+                )
+                return
+
+    def _step_pick_transport(self) -> None:
+        if self._manager_place_requested:
+            self._manager_place_requested = False
+            self._change_state(
+                M0609State.PLACE
+            )
+            return
+
+        if self._pick_phase == PickPhase.MOVE_TRANSIT:
             self.robot.apply_action(
                 self.move_controller.forward()
             )
 
             if self.move_controller.is_done():
+                self._transport_transit_reached = True
+
                 current = np.asarray(
                     self.robot.get_joint_positions(),
                     dtype=np.float64,
@@ -1005,9 +1218,35 @@ class M0609StateMachine:
                     )
                     return
 
-                self._start_joint1_rotation(
+                joint1_tracking_target = (
                     self._joint1_before_tracking
                     + delta
+                )
+
+                # 경유지 도착 시점의 관절 자세를 기준으로
+                # TRACKING 복귀용 안전 자세를 미리 만든다.
+                # joint2~joint6는 그대로 유지하고,
+                # joint1만 TRACKING 목표 각도로 교체한다.
+                self._safe_tracking_joint_positions = (
+                    current.copy()
+                )
+                self._safe_tracking_joint_positions[0] = (
+                    joint1_tracking_target
+                )
+
+                safe_pose_deg = np.degrees(
+                    self._safe_tracking_joint_positions
+                ).round(2)
+
+                print(
+                    f"[SAFE {self.robot_id}] "
+                    "TRACKING 목표 관절 자세 사전 저장: "
+                    f"{safe_pose_deg} deg",
+                    flush=True,
+                )
+
+                self._start_joint1_rotation(
+                    joint1_tracking_target
                 )
                 self._pick_phase = (
                     PickPhase.ROTATE_JOINT1_OUT
@@ -1015,14 +1254,18 @@ class M0609StateMachine:
 
         elif self._pick_phase == PickPhase.ROTATE_JOINT1_OUT:
             if self._step_joint1_rotation():
-                # 90도 회전이 끝난 실제 TCP pose 자체를
-                # 안전 위치로 저장하고 바로 TRACKING을 시작한다.
-                self._capture_safe_tracking_pose()
                 self._change_state(
                     M0609State.TRACKING
                 )
 
     def _step_tracking(self) -> None:
+        if self._manager_place_requested:
+            self._manager_place_requested = False
+            self._change_state(
+                M0609State.PLACE
+            )
+            return
+
         hand_mode, sequence = self.hand_input.get_mode()
 
         if sequence != self._last_hand_mode_sequence:
@@ -1259,9 +1502,23 @@ class M0609StateMachine:
                 )
 
                 self._clear_active_tray()
-                self._change_state(
-                    M0609State.RETURN_HOME
-                )
+
+                if self._skip_return_home_once:
+                    self._skip_return_home_once = False
+
+                    print(
+                        f"[REPLACEMENT {self.robot_id}] "
+                        "RETURN_HOME 생략, 다음 도구 작업 대기",
+                        flush=True,
+                    )
+
+                    self._change_state(
+                        M0609State.IDLE
+                    )
+                else:
+                    self._change_state(
+                        M0609State.RETURN_HOME
+                    )
 
     def _step_return_home(self) -> None:
         current_joint_positions = np.asarray(
@@ -1352,6 +1609,7 @@ class M0609StateMachine:
 
         self._joint1_before_pre_pick = None
         self._joint1_before_tracking = None
+        self._transport_transit_reached = False
         self._joint1_target = None
         self._safe_tracking_joint_positions = None
 
@@ -1368,8 +1626,14 @@ class M0609StateMachine:
 
             if self._state == M0609State.IDLE:
                 self._on_enter_idle()
-            elif self._state == M0609State.PICK:
+            elif self._state == M0609State.PICK_APPROACH:
                 self._on_enter_pick()
+            elif self._state == M0609State.PICK_TRANSPORT:
+                print(
+                    f"[PICK_TRANSPORT {self.robot_id}] "
+                    "도구 운반 및 TRACKING 위치 이동",
+                    flush=True,
+                )
             elif self._state == M0609State.TRACKING:
                 self._on_enter_tracking()
             elif self._state == M0609State.PLACE:
@@ -1379,8 +1643,10 @@ class M0609StateMachine:
 
         if self._state == M0609State.IDLE:
             self._step_idle()
-        elif self._state == M0609State.PICK:
-            self._step_pick()
+        elif self._state == M0609State.PICK_APPROACH:
+            self._step_pick_approach()
+        elif self._state == M0609State.PICK_TRANSPORT:
+            self._step_pick_transport()
         elif self._state == M0609State.TRACKING:
             self._step_tracking()
         elif self._state == M0609State.PLACE:
@@ -1400,12 +1666,17 @@ class M0609StateMachine:
         # 집기 전/운반 경로 상태도 Play 재시작 시 초기화한다.
         self._joint1_before_pre_pick = None
         self._joint1_before_tracking = None
+        self._transport_transit_reached = False
         self._joint1_target = None
         self._safe_tracking_joint_positions = None
         self._transport_orientation = None
 
         self._last_hand_mode_sequence = -1
         self._tracking_error_reported = False
+        self._manager_place_requested = False
+        self._place_request_source_state = None
+        self._cancel_pick_approach_requested = False
+        self._skip_return_home_once = False
 
         self._clear_active_tray()
 

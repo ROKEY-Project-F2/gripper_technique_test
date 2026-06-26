@@ -6,6 +6,7 @@ from typing import Dict, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
+from operation_registry import OperationRegistry
 from robot_runtime import RobotProfile, RobotTask
 from tool_state_manager import ToolStateManager
 
@@ -17,6 +18,14 @@ class ManagedRobot:
     active_task: Optional[RobotTask] = None
     last_state: str = "IDLE"
     last_place_release_sequence: int = 0
+
+    # TRACKING 중 교체 요청이 들어오면,
+    # 기존 도구를 원복한 뒤 같은 로봇이 수행할 작업.
+    pending_replacement_tray_id: Optional[int] = None
+
+    # 현재 수행 중인 작업과 교체 대기 작업의 레지스트리 ID.
+    active_operation_id: Optional[str] = None
+    pending_replacement_operation_id: Optional[str] = None
 
 
 class RobotManager:
@@ -57,6 +66,7 @@ class RobotManager:
         self._tool_state_manager = (
             tool_state_manager
         )
+        self._operation_registry = OperationRegistry()
 
         self._tray_positions = {
             int(tray_id): np.asarray(
@@ -261,6 +271,252 @@ class RobotManager:
 
         return candidates
 
+    def _get_tool_id_for_tray(
+        self,
+        tray_id: int,
+    ) -> Optional[str]:
+        if self._tool_state_manager is None:
+            return None
+
+        return self._tool_state_manager.get_tool_for_tray(
+            int(tray_id)
+        )
+
+    def _create_operation(
+        self,
+        *,
+        tray_id: int,
+        robot_id: Optional[str],
+        status: str,
+        is_replacement: bool,
+    ) -> str:
+        return self._operation_registry.create_operation(
+            tray_id=tray_id,
+            tool_id=self._get_tool_id_for_tray(
+                tray_id
+            ),
+            robot_id=robot_id,
+            status=status,
+            is_replacement=is_replacement,
+        )
+
+    def _update_active_operation_state(
+        self,
+        *,
+        managed: ManagedRobot,
+        state_name: str,
+    ) -> None:
+        operation_id = managed.active_operation_id
+
+        if operation_id is None:
+            return
+
+        self._operation_registry.update_operation(
+            operation_id,
+            status=state_name,
+            robot_id=managed.profile.robot_id,
+        )
+
+    def _find_tracking_replacement_candidates(
+        self,
+        tray_id: int,
+    ) -> list[ManagedRobot]:
+        """
+        IDLE 로봇이 없고 두 로봇이 TRACKING 중일 때
+        교체 작업을 맡을 후보를 찾는다.
+
+        교체 요청에서는 담당 홀짝 우선순위를 사용하지 않고,
+        새 도구 트레이까지의 거리만 비교한다.
+        """
+        candidates: list[ManagedRobot] = []
+
+        for managed in self._robots.values():
+            if (
+                tray_id
+                not in managed.profile.reachable_trays
+            ):
+                continue
+
+            if (
+                managed.state_machine.state_name
+                != "TRACKING"
+            ):
+                continue
+
+            if managed.active_task is None:
+                continue
+
+            if (
+                managed.pending_replacement_tray_id
+                is not None
+            ):
+                continue
+
+            candidates.append(managed)
+
+        candidates.sort(
+            key=lambda managed: (
+                self._distance_to_tray(
+                    managed=managed,
+                    tray_id=tray_id,
+                ),
+                managed.profile.robot_id,
+            )
+        )
+
+        return candidates
+
+    def _queue_tracking_replacement(
+        self,
+        *,
+        managed: ManagedRobot,
+        tray_id: int,
+    ) -> Tuple[bool, str]:
+        robot_id = managed.profile.robot_id
+
+        accepted, message = (
+            managed.state_machine
+            .request_place_from_manager(
+                skip_return_home=True
+            )
+        )
+
+        if not accepted:
+            return False, message
+
+        managed.pending_replacement_tray_id = (
+            int(tray_id)
+        )
+        managed.pending_replacement_operation_id = (
+            self._create_operation(
+                tray_id=tray_id,
+                robot_id=robot_id,
+                status="PENDING_REPLACEMENT",
+                is_replacement=True,
+            )
+        )
+
+        distance = self._distance_to_tray(
+            managed=managed,
+            tray_id=tray_id,
+        )
+
+        result = (
+            f"Robot {robot_id} selected for replacement: "
+            f"current tool PLACE, skip RETURN_HOME, "
+            f"then tray {tray_id}, "
+            f"distance={distance:.4f} m"
+        )
+
+        print(
+            f"[Manager REPLACE] {result}",
+            flush=True,
+        )
+
+        return True, result
+
+    def _try_assign_pending_replacement(
+        self,
+        managed: ManagedRobot,
+    ) -> None:
+        tray_id = (
+            managed.pending_replacement_tray_id
+        )
+
+        if tray_id is None:
+            return
+
+        if (
+            managed.state_machine.state_name
+            != "IDLE"
+        ):
+            return
+
+        if managed.active_task is not None:
+            return
+
+        if (
+            self._tool_state_manager is not None
+            and self._tool_state_manager.get_tool_for_tray(
+                tray_id
+            ) is None
+        ):
+            print(
+                "[Manager REPLACE] pending request cancelled: "
+                f"tray {tray_id} is empty",
+                flush=True,
+            )
+            if (
+                managed.pending_replacement_operation_id
+                is not None
+            ):
+                self._operation_registry.cancel_operation(
+                    managed.pending_replacement_operation_id
+                )
+
+            managed.pending_replacement_tray_id = None
+            managed.pending_replacement_operation_id = None
+            return
+
+        task = self._create_task(
+            managed=managed,
+            tray_id=tray_id,
+        )
+
+        if (
+            task.uses_shared_zone
+            and not self._try_acquire_tray_zone(
+                robot_id=managed.profile.robot_id
+            )
+        ):
+            # 다른 로봇이 트레이 구역을 사용하는 동안은
+            # 요청을 유지하고 다음 step에서 다시 시도한다.
+            return
+
+        accepted, message = (
+            managed.state_machine.assign_task(
+                task
+            )
+        )
+
+        if not accepted:
+            if task.uses_shared_zone:
+                self._release_tray_zone(
+                    robot_id=managed.profile.robot_id
+                )
+            return
+
+        managed.active_task = task
+        managed.active_operation_id = (
+            managed.pending_replacement_operation_id
+        )
+
+        if managed.active_operation_id is None:
+            managed.active_operation_id = (
+                self._create_operation(
+                    tray_id=tray_id,
+                    robot_id=managed.profile.robot_id,
+                    status="PICK",
+                    is_replacement=True,
+                )
+            )
+        else:
+            self._operation_registry.update_operation(
+                managed.active_operation_id,
+                status="PICK",
+                robot_id=managed.profile.robot_id,
+            )
+
+        managed.pending_replacement_tray_id = None
+        managed.pending_replacement_operation_id = None
+
+        print(
+            "[Manager REPLACE] pending task assigned: "
+            f"robot={managed.profile.robot_id}, "
+            f"tray={tray_id}",
+            flush=True,
+        )
+
     # ========================================================
     # 신규 트레이 PICK/PLACE 구역 락
     # ========================================================
@@ -346,7 +602,8 @@ class RobotManager:
             return True
 
         return state_name in {
-            "PICK",
+            "PICK_APPROACH",
+            "PICK_TRANSPORT",
             "PLACE",
         }
 
@@ -360,8 +617,17 @@ class RobotManager:
         robot_id = managed.profile.robot_id
 
         if (
-            previous_state == "PICK"
+            previous_state == "PICK_TRANSPORT"
             and current_state == "TRACKING"
+        ):
+            self._release_tray_zone(
+                robot_id=robot_id
+            )
+            return
+
+        if (
+            previous_state == "PICK_APPROACH"
+            and current_state == "RETURN_HOME"
         ):
             self._release_tray_zone(
                 robot_id=robot_id
@@ -443,8 +709,20 @@ class RobotManager:
         )
 
         if not candidates:
+            tracking_candidates = (
+                self._find_tracking_replacement_candidates(
+                    tray_index
+                )
+            )
+
+            if tracking_candidates:
+                return self._queue_tracking_replacement(
+                    managed=tracking_candidates[0],
+                    tray_id=tray_index,
+                )
+
             message = (
-                "No IDLE robot can reach tray "
+                "No IDLE or TRACKING robot can accept tray "
                 f"{tray_index}"
             )
 
@@ -513,6 +791,14 @@ class RobotManager:
                 continue
 
             managed.active_task = task
+            managed.active_operation_id = (
+                self._create_operation(
+                    tray_id=tray_index,
+                    robot_id=robot_id,
+                    status="PICK",
+                    is_replacement=False,
+                )
+            )
 
             distance = self._distance_to_tray(
                 managed=managed,
@@ -540,10 +826,135 @@ class RobotManager:
         )
         return False, message
 
+    def get_tool_command_status(
+        self,
+        tool_id: str,
+    ) -> dict:
+        normalized_tool_id = str(tool_id).strip()
+
+        result = {
+            "tool_id": normalized_tool_id,
+            "status": "UNKNOWN",
+            "robot_id": None,
+            "operation_id": None,
+        }
+
+        if not normalized_tool_id:
+            return result
+
+        operation = (
+            self._operation_registry
+            .get_operation_for_tool(
+                normalized_tool_id
+            )
+        )
+
+        if operation is not None:
+            result["operation_id"] = operation.get(
+                "operation_id"
+            )
+            result["robot_id"] = operation.get(
+                "robot_id"
+            )
+
+            operation_status = str(
+                operation.get("status", "")
+            ).strip().upper()
+
+            if operation_status == "PENDING_REPLACEMENT":
+                result["status"] = "PENDING_REPLACEMENT"
+                return result
+
+            managed = self._robots.get(
+                str(operation.get("robot_id", "")).upper()
+            )
+
+            if managed is not None:
+                state_name = (
+                    managed.state_machine.state_name
+                )
+
+                status_map = {
+                    "PICK_APPROACH": "PICKING",
+                    "PICK_TRANSPORT": "TRANSPORTING",
+                    "TRACKING": "TRACKING",
+                    "PLACE": "RETURNING",
+                    "RETURN_HOME": "RETURNING",
+                }
+
+                if state_name in status_map:
+                    result["status"] = status_map[state_name]
+                    return result
+
+            if operation_status:
+                result["status"] = operation_status
+                return result
+
+        if self._tool_state_manager is None:
+            return result
+
+        tray_id = (
+            self._tool_state_manager
+            .get_tray_for_tool(
+                normalized_tool_id
+            )
+        )
+
+        if tray_id is not None:
+            result["status"] = "AVAILABLE"
+            result["tray_id"] = tray_id
+
+        return result
+
+    def _duplicate_request_message(
+        self,
+        *,
+        tool_id: str,
+        status: str,
+    ) -> str:
+        messages = {
+            "PICKING": f"{tool_id} is already being picked",
+            "TRANSPORTING": f"{tool_id} is already being transported",
+            "TRACKING": f"{tool_id} is already in tracking",
+            "RETURNING": f"{tool_id} is already being returned",
+            "PENDING_REPLACEMENT": (
+                f"{tool_id} is already pending as a replacement"
+            ),
+        }
+        return messages.get(
+            status,
+            f"{tool_id} already has an active operation: {status}",
+        )
+
     def request_tool_command(
         self,
         tool_id: str,
     ) -> Tuple[bool, str]:
+        normalized_tool_id = str(tool_id).strip()
+
+        if not normalized_tool_id:
+            return False, "tool_id is empty"
+
+        command_status = self.get_tool_command_status(
+            normalized_tool_id
+        )
+        current_status = command_status["status"]
+
+        if current_status in {
+            "PICKING",
+            "TRANSPORTING",
+            "TRACKING",
+            "RETURNING",
+            "PENDING_REPLACEMENT",
+        }:
+            return (
+                False,
+                self._duplicate_request_message(
+                    tool_id=normalized_tool_id,
+                    status=current_status,
+                ),
+            )
+
         if self._tool_state_manager is None:
             return (
                 False,
@@ -552,17 +963,295 @@ class RobotManager:
 
         tray_id = (
             self._tool_state_manager
-            .get_tray_for_tool(tool_id)
+            .get_tray_for_tool(normalized_tool_id)
         )
 
         if tray_id is None:
             return (
                 False,
-                f"Tool is not available on a tray: {tool_id}",
+                f"Tool is not available on a tray: {normalized_tool_id}",
             )
 
         return self.request_pick_command(
             tray_id
+        )
+
+    def _find_managed_robot_for_operation(
+        self,
+        operation: dict,
+    ) -> Optional[ManagedRobot]:
+        robot_id = operation.get("robot_id")
+        operation_id = operation.get("operation_id")
+
+        if robot_id is None:
+            return None
+
+        managed = self._robots.get(
+            str(robot_id).strip().upper()
+        )
+
+        if managed is None:
+            return None
+
+        if managed.state_machine.state_name not in {
+            "PICK_APPROACH",
+            "PICK_TRANSPORT",
+            "TRACKING",
+        }:
+            return None
+
+        if managed.active_task is None:
+            return None
+
+        if (
+            operation_id is not None
+            and managed.active_operation_id is not None
+            and managed.active_operation_id != operation_id
+        ):
+            return None
+
+        return managed
+
+    def _find_robot_for_tool_return(
+        self,
+        tool_id: str,
+    ) -> Optional[ManagedRobot]:
+        normalized_tool_id = str(tool_id).strip()
+
+        # 도구를 이미 집은 상태는 ToolStateManager의
+        # HELD_BY_ROBOT 정보를 우선 사용한다.
+        if self._tool_state_manager is not None:
+            for robot_id, managed in self._robots.items():
+                if managed.state_machine.state_name not in {
+                    "PICK_TRANSPORT",
+                    "TRACKING",
+                }:
+                    continue
+
+                held_tool = (
+                    self._tool_state_manager
+                    .get_held_tool(robot_id)
+                )
+
+                if held_tool == normalized_tool_id:
+                    return managed
+
+        # PICK_APPROACH는 아직 트레이에 있으므로
+        # 현재 active operation의 tool_id로 찾는다.
+        operation = (
+            self._operation_registry
+            .get_operation_for_tool(
+                normalized_tool_id
+            )
+        )
+
+        if operation is None:
+            return None
+
+        return self._find_managed_robot_for_operation(
+            operation
+        )
+
+    def _request_managed_robot_return(
+        self,
+        *,
+        managed: ManagedRobot,
+        tool_id: Optional[str],
+        operation_id: Optional[str],
+    ) -> Tuple[bool, str]:
+        state_name = managed.state_machine.state_name
+
+        if state_name not in {
+            "PICK_APPROACH",
+            "PICK_TRANSPORT",
+            "TRACKING",
+        }:
+            return (
+                False,
+                f"Robot {managed.profile.robot_id} "
+                f"cannot cancel/return in {state_name}",
+            )
+
+        if managed.active_task is None:
+            return (
+                False,
+                f"Robot {managed.profile.robot_id} has no active task",
+            )
+
+        if managed.pending_replacement_tray_id is not None:
+            return (
+                False,
+                f"Robot {managed.profile.robot_id} "
+                "already has a replacement request",
+            )
+
+        accepted, message = (
+            managed.state_machine
+            .request_cancel_and_return_from_manager()
+        )
+
+        if not accepted:
+            return False, message
+
+        result = (
+            "Cancel/return requested: "
+            f"operation={operation_id}, "
+            f"robot={managed.profile.robot_id}, "
+            f"tool={tool_id}, "
+            f"state={state_name}"
+        )
+
+        print(
+            f"[Manager RETURN] {result}",
+            flush=True,
+        )
+
+        return True, result
+
+    def _request_operation_return(
+        self,
+        operation: dict,
+    ) -> Tuple[bool, str]:
+        managed = (
+            self._find_managed_robot_for_operation(
+                operation
+            )
+        )
+
+        if managed is None:
+            return (
+                False,
+                "Operation robot is not in a cancellable state",
+            )
+
+        return self._request_managed_robot_return(
+            managed=managed,
+            tool_id=operation.get("tool_id"),
+            operation_id=operation.get("operation_id"),
+        )
+
+    def request_tool_return(
+        self,
+        tool_id: str,
+    ) -> Tuple[bool, str]:
+        """
+        같은 기존 반납 토픽으로 PICK/TRACKING 작업을 취소한다.
+
+        PICK_APPROACH:
+            도구 미흡착 -> RETURN_HOME
+
+        PICK_TRANSPORT / TRACKING:
+            도구 보유 -> PLACE -> RETURN_HOME
+        """
+        normalized_tool_id = str(
+            tool_id
+        ).strip()
+
+        if not normalized_tool_id:
+            return False, "tool_id is empty"
+
+        command_status = self.get_tool_command_status(
+            normalized_tool_id
+        )
+
+        if command_status["status"] == "RETURNING":
+            return (
+                False,
+                f"{normalized_tool_id} is already being returned",
+            )
+
+        if command_status["status"] == "AVAILABLE":
+            return (
+                False,
+                f"{normalized_tool_id} is already on a tray",
+            )
+
+        managed = self._find_robot_for_tool_return(
+            normalized_tool_id
+        )
+
+        if managed is None:
+            return (
+                False,
+                f"No cancellable active operation for tool: "
+                f"{normalized_tool_id}",
+            )
+
+        return self._request_managed_robot_return(
+            managed=managed,
+            tool_id=normalized_tool_id,
+            operation_id=managed.active_operation_id,
+        )
+
+    def request_recent_tool_return(
+        self,
+    ) -> Tuple[bool, str]:
+        """
+        가장 최근 PICK_APPROACH/PICK_TRANSPORT/TRACKING 작업을
+        기존 최근 반납 토픽으로 취소 또는 반환한다.
+        """
+        cancellable_states = {
+            "PICK_APPROACH",
+            "PICK_TRANSPORT",
+            "TRACKING",
+        }
+
+        candidates = [
+            managed
+            for managed in self._robots.values()
+            if (
+                managed.state_machine.state_name
+                in cancellable_states
+                and managed.active_task is not None
+            )
+        ]
+
+        if not candidates:
+            return (
+                False,
+                "No cancellable active operation",
+            )
+
+        def recent_key(managed: ManagedRobot):
+            operation_id = managed.active_operation_id or ""
+            try:
+                return int(
+                    operation_id.rsplit("_", 1)[-1]
+                )
+            except (TypeError, ValueError):
+                return -1
+
+        managed = max(
+            candidates,
+            key=recent_key,
+        )
+
+        tool_id = None
+
+        if self._tool_state_manager is not None:
+            tool_id = (
+                self._tool_state_manager
+                .get_held_tool(
+                    managed.profile.robot_id
+                )
+            )
+
+        if tool_id is None and managed.active_operation_id is not None:
+            try:
+                operation = (
+                    self._operation_registry
+                    .get_operation(
+                        managed.active_operation_id
+                    )
+                )
+                tool_id = operation.get("tool_id")
+            except KeyError:
+                pass
+
+        return self._request_managed_robot_return(
+            managed=managed,
+            tool_id=tool_id,
+            operation_id=managed.active_operation_id,
         )
 
     def update_external_tool_detection(
@@ -594,6 +1283,40 @@ class RobotManager:
             .get_debug_snapshot()
         )
 
+    def get_operation_registry_snapshot(
+        self,
+    ) -> dict:
+        return self._operation_registry.get_snapshot()
+
+    def get_active_operations(
+        self,
+    ) -> dict:
+        return (
+            self._operation_registry
+            .get_active_operations()
+        )
+
+    def get_operation_for_tool(
+        self,
+        tool_id: str,
+    ) -> Optional[dict]:
+        return (
+            self._operation_registry
+            .get_operation_for_tool(tool_id)
+        )
+
+    def get_recent_operation_ids(
+        self,
+        *,
+        limit: Optional[int] = None,
+    ) -> list[str]:
+        return (
+            self._operation_registry
+            .get_recent_operation_ids(
+                limit=limit
+            )
+        )
+
     def request_move(
         self,
         x: float,
@@ -611,6 +1334,10 @@ class RobotManager:
             self._tool_state_manager.synchronize_external_state()
 
         for managed in self._robots.values():
+            self._try_assign_pending_replacement(
+                managed
+            )
+
             robot_id = managed.profile.robot_id
             previous_state = (
                 managed.state_machine.state_name
@@ -680,15 +1407,21 @@ class RobotManager:
                 )
 
                 managed.last_state = current_state
+                self._update_active_operation_state(
+                    managed=managed,
+                    state_name=current_state,
+                )
 
             if (
                 self._tool_state_manager is not None
                 and managed.active_task is not None
             ):
                 if (
-                    previous_state == "PICK"
-                    and current_state == "TRACKING"
+                    previous_state == "PICK_APPROACH"
+                    and current_state == "PICK_TRANSPORT"
                 ):
+                    # 흡착 완료 시점부터 해당 도구를
+                    # HELD_BY_ROBOT 상태로 관리한다.
                     self._tool_state_manager.on_tracking_enter(
                         robot_id=robot_id,
                         tray_id=managed.active_task.tray_id,
@@ -729,7 +1462,13 @@ class RobotManager:
                     flush=True,
                 )
 
+                if managed.active_operation_id is not None:
+                    self._operation_registry.complete_operation(
+                        managed.active_operation_id
+                    )
+
                 managed.active_task = None
+                managed.active_operation_id = None
 
     def reset(
         self,
@@ -740,6 +1479,9 @@ class RobotManager:
 
         for managed in self._robots.values():
             managed.active_task = None
+            managed.active_operation_id = None
+            managed.pending_replacement_tray_id = None
+            managed.pending_replacement_operation_id = None
             managed.state_machine.reset()
             managed.last_state = (
                 managed.state_machine.state_name
@@ -751,6 +1493,8 @@ class RobotManager:
                     0,
                 )
             )
+
+        self._operation_registry.reset()
 
         tool_layout = None
 
