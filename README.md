@@ -1254,3 +1254,16 @@ Isaac Sim 내부 예외 후 자동 재시작
 ```
 
 이 항목은 정상 취소·반납 기능과는 별도의 오류 복구 기능입니다.
+
+
+씬 복원 명령어
+```bash
+cat Collected_full_scene.tar.gz.part-* > Collected_full_scene.tar.gz
+tar -xzf Collected_full_scene.tar.gz
+```
+
+이미지 복원 명령어
+```bash
+cat docs.tar.gz.part-* > docs.tar.gz
+tar -xzf docs.tar.gz
+```
