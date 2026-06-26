@@ -35,9 +35,9 @@ ROS2 Publisher
 |:---:|---|---|
 | 0 | 메스 | scalpel, 스칼펠, 메쓰, 칼, 절개도 |
 | 1 | 가위 | scissors, 시저스, 시져스 |
-| 2 | 포셉 | forceps, 겸자, 헤모스탯, 지혈겸자, 핀셋, 집게 |
-| 3 | 클램프 | clamp, 클램프형겸자 |
-| 4 | 석션 | suction, 흡인기, 빨아들이는거, 흡입기 |
+| 2 | 톱 | handsaw, saw, 쏘우, 톱, 
+| 3 | 캘리퍼 | caliper, ruler, measure, 캘리퍼, 자, 측정기
+| 4 | 망치 | mallet, hammer, 망치, 해머
 | 5 | 니들홀더 | needle holder, 바늘잡이, 봉합기 |
 
 ---
