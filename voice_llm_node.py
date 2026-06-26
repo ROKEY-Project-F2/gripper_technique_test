@@ -44,7 +44,7 @@ TOOL_TABLE = {
 TOOL_NAME_BY_ID = {v: k for k, v in TOOL_TABLE.items()}
 
 # ── Gemini 설정 ───────────────────────────────
-genai.configure(api_key="")  # API 키 입력
+genai.configure(api_key="#Your API Key")  # API 키 입력
 
 gemini_model = genai.GenerativeModel(
     model_name="gemini-2.5-flash",
